@@ -90,7 +90,11 @@ class KVServiceSMBackend(StorageBackendInterface):
             "kv_service_sm_shared_memory_name", "shared_memory"
         )
         self.bucket_name = extra_config.get("kv_service_sm_bucket", "lmcache")
-        self.timeout_ms = extra_config.get("kv_service_sm_timeout_ms", 5000)
+        
+        # Separate timeout configurations for different operations
+        self.lease_timeout_ms = extra_config.get("kv_service_sm_lease_timeout_ms", 500)
+        self.put_timeout_ms = extra_config.get("kv_service_sm_put_timeout_ms", 5000)
+        self.release_timeout_ms = extra_config.get("kv_service_sm_release_timeout_ms", 2000)
 
         # Performance optimizations for scale
         self.max_connections = extra_config.get("kv_service_sm_max_connections", 256)
@@ -131,7 +135,9 @@ class KVServiceSMBackend(StorageBackendInterface):
             f"bucket: {self.bucket_name}, shared_memory: {self.shared_memory_name}, "
             f"max_connections: {self.max_connections}, "
             f"max_connections_per_host: {self.max_connections_per_host}, "
-            f"serialization_threads: {self.serialization_threads}"
+            f"serialization_threads: {self.serialization_threads}, "
+            f"timeouts (ms): lease={self.lease_timeout_ms}, "
+            f"put={self.put_timeout_ms}, release={self.release_timeout_ms}"
         )
 
     def __str__(self):
@@ -252,7 +258,7 @@ class KVServiceSMBackend(StorageBackendInterface):
                 }
                 return result
         except asyncio.TimeoutError:
-            logger.warning(f"HTTP {method} request timeout for {url}")
+            logger.warning(f"HTTP {method} request timeout for {url} (timeout: {timeout}s)")
             return None
         except aiohttp.ClientError as e:
             logger.error(f"HTTP {method} client error for {url}: {e}")
@@ -297,7 +303,7 @@ class KVServiceSMBackend(StorageBackendInterface):
             # HTTP request on event loop (I/O-bound operation)
             http_start = loop.time()
             result = await self._http_request(
-                "PUT", url, data=data, timeout=self.timeout_ms / 1000.0
+                "PUT", url, data=data, timeout=self.put_timeout_ms / 1000.0
             )
             http_time = loop.time() - http_start
 
@@ -378,10 +384,12 @@ class KVServiceSMBackend(StorageBackendInterface):
         """Acquire a lease for the given key from KVServiceSM daemon."""
         key_str = self._key_to_string(key)
         url = f"{self.base_url}/v1/kv/{self.bucket_name}/{key_str}/leases"
-        params = {"timeout_ms": self.timeout_ms}
+        params = {"timeout_ms": self.lease_timeout_ms}
+        
+        logger.debug(f"Acquiring lease for key {key_str} with timeout {self.lease_timeout_ms}ms")
 
         result = await self._http_request(
-            "POST", url, params=params, timeout=self.timeout_ms / 1000.0
+            "POST", url, params=params, timeout=self.lease_timeout_ms / 1000.0
         )
 
         if result and result["status"] == 200 and result["json"]:
@@ -399,12 +407,12 @@ class KVServiceSMBackend(StorageBackendInterface):
             logger.debug(f"Lease acquired successfully: {lease_info.lease_id}")
             return lease_info
         
-        logger.debug(f"Failed to acquire lease - key not found in daemon")
+        logger.debug(f"Failed to acquire lease for {key_str} - timeout after {self.lease_timeout_ms}ms")
         return None
 
     async def _release_lease(self, lease_id: str) -> bool:
         url = f"{self.base_url}/v1/leases/{lease_id}/release"
-        result = await self._http_request("POST", url, timeout=2.0)
+        result = await self._http_request("POST", url, timeout=self.release_timeout_ms / 1000.0)
 
         # Consider both 200 OK and 404 Not Found as "success" since in both cases
         # the lease is no longer active on the server
