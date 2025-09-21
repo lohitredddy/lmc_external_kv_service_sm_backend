@@ -14,12 +14,13 @@
 # limitations under the License.
 
 # Standard
+import asyncio
+import os
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Dict, List, Optional, Tuple
-import asyncio
-import threading
 
 # Third Party
 import aiohttp
@@ -37,6 +38,10 @@ from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 
 logger = init_logger(__name__)
+
+
+REMOTE_METADATA_INT_COUNT = 7
+REMOTE_METADATA_HEADER_BYTES = 4 * REMOTE_METADATA_INT_COUNT
 
 
 @dataclass
@@ -95,24 +100,49 @@ class KVServiceSMBackend(StorageBackendInterface):
         self.lease_timeout_ms = extra_config.get("kv_service_sm_lease_timeout_ms", 500)
         self.put_timeout_ms = extra_config.get("kv_service_sm_put_timeout_ms", 5000)
         self.release_timeout_ms = extra_config.get("kv_service_sm_release_timeout_ms", 2000)
+        self.lease_timeout_seconds = max(0.001, self.lease_timeout_ms / 1000.0)
+        self.put_timeout_seconds = max(0.001, self.put_timeout_ms / 1000.0)
+        self.release_timeout_seconds = max(0.001, self.release_timeout_ms / 1000.0)
 
         # Performance optimizations for scale
         self.max_connections = extra_config.get("kv_service_sm_max_connections", 256)
         self.max_connections_per_host = extra_config.get(
             "kv_service_sm_max_connections_per_host", 128
         )
-        self.serialization_threads = extra_config.get(
-            "kv_service_sm_serialization_threads", 16
+        default_serialization_threads = min(
+            32, max(4, (os.cpu_count() or 8))
         )
+        serialization_threads = extra_config.get(
+            "kv_service_sm_serialization_threads",
+            default_serialization_threads,
+        )
+        self.serialization_threads = max(1, int(serialization_threads))
+        deserialization_threads = extra_config.get(
+            "kv_service_sm_deserialization_threads",
+            self.serialization_threads,
+        )
+        self.deserialization_threads = max(1, int(deserialization_threads))
 
         # HTTP connection pool for high-scale performance
         self.http_session: Optional[aiohttp.ClientSession] = None
         self.session_lock = asyncio.Lock()
 
+        self._timeout_profiles = {
+            "lease": aiohttp.ClientTimeout(total=self.lease_timeout_seconds),
+            "put": aiohttp.ClientTimeout(total=self.put_timeout_seconds),
+            "release": aiohttp.ClientTimeout(total=self.release_timeout_seconds),
+        }
+
         # Thread pool for CPU-bound serialization operations
         self.thread_pool = ThreadPoolExecutor(
             max_workers=self.serialization_threads,
             thread_name_prefix="kv-service-sm-serialize",
+        )
+
+        # Thread pool dedicated to reconstructing tensors from shared memory
+        self.deserialize_pool = ThreadPoolExecutor(
+            max_workers=self.deserialization_threads,
+            thread_name_prefix="kv-service-sm-deserialize",
         )
 
         self.lease_lock = threading.Lock()
@@ -136,6 +166,7 @@ class KVServiceSMBackend(StorageBackendInterface):
             f"max_connections: {self.max_connections}, "
             f"max_connections_per_host: {self.max_connections_per_host}, "
             f"serialization_threads: {self.serialization_threads}, "
+            f"deserialization_threads: {self.deserialization_threads}, "
             f"timeouts (ms): lease={self.lease_timeout_ms}, "
             f"put={self.put_timeout_ms}, release={self.release_timeout_ms}"
         )
@@ -237,35 +268,67 @@ class KVServiceSMBackend(StorageBackendInterface):
         return self.http_session
 
     async def _http_request(
-        self, method: str, url: str, data=None, params=None, timeout=5.0
+        self,
+        method: str,
+        url: str,
+        *,
+        data=None,
+        params=None,
+        timeout_profile: Optional[str] = None,
+        expect_json: bool = False,
+        read_body: bool = False,
     ):
         """Optimized HTTP request with connection pooling."""
-        try:
-            session = await self._ensure_http_session()
-            request_timeout = aiohttp.ClientTimeout(total=timeout)
 
+        session = await self._ensure_http_session()
+        timeout = self._timeout_profiles.get(timeout_profile) if timeout_profile else None
+
+        try:
             async with session.request(
-                method, url, data=data, params=params, timeout=request_timeout
+                method,
+                url,
+                data=data,
+                params=params,
+                timeout=timeout,
             ) as response:
-                result = {
+                body_bytes = None
+                json_body = None
+
+                if expect_json:
+                    try:
+                        json_body = await response.json()
+                    except Exception as exc:  # pragma: no cover - defensive logging
+                        logger.error(
+                            "Failed to decode JSON response for %s %s: %s",
+                            method,
+                            url,
+                            exc,
+                        )
+                        json_body = None
+                elif read_body:
+                    body_bytes = await response.read()
+                else:
+                    # Drain any remaining response data to return the connection
+                    await response.read()
+
+                return {
                     "status": response.status,
-                    "data": await response.read()
-                    if method in ["PUT", "POST"]
-                    else None,
-                    "json": await response.json()
-                    if response.content_type == "application/json"
-                    else None,
+                    "data": body_bytes,
+                    "json": json_body,
                 }
-                return result
         except asyncio.TimeoutError:
-            logger.warning(f"HTTP {method} request timeout for {url} (timeout: {timeout}s)")
-            return None
-        except aiohttp.ClientError as e:
-            logger.error(f"HTTP {method} client error for {url}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"HTTP {method} request failed for {url}: {e}")
-            return None
+            logger.error(
+                "HTTP %s request timeout for %s (profile: %s)",
+                method,
+                url,
+                timeout_profile,
+            )
+        except aiohttp.ClientError as exc:
+            logger.error("HTTP %s client error for %s: %s", method, url, exc)
+        except Exception as exc:
+            logger.error("HTTP %s request failed for %s: %s", method, url, exc)
+
+        return None
 
     @_lmcache_nvtx_annotate
     async def _async_put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
@@ -303,7 +366,7 @@ class KVServiceSMBackend(StorageBackendInterface):
             # HTTP request on event loop (I/O-bound operation)
             http_start = loop.time()
             result = await self._http_request(
-                "PUT", url, data=data, timeout=self.put_timeout_ms / 1000.0
+                "PUT", url, data=data, timeout_profile="put"
             )
             http_time = loop.time() - http_start
 
@@ -389,7 +452,11 @@ class KVServiceSMBackend(StorageBackendInterface):
         logger.debug(f"Acquiring lease for key {key_str} with timeout {self.lease_timeout_ms}ms")
 
         result = await self._http_request(
-            "POST", url, params=params, timeout=self.lease_timeout_ms / 1000.0
+            "POST",
+            url,
+            params=params,
+            timeout_profile="lease",
+            expect_json=True,
         )
 
         if result and result["status"] == 200 and result["json"]:
@@ -412,7 +479,9 @@ class KVServiceSMBackend(StorageBackendInterface):
 
     async def _release_lease(self, lease_id: str) -> bool:
         url = f"{self.base_url}/v1/leases/{lease_id}/release"
-        result = await self._http_request("POST", url, timeout=self.release_timeout_ms / 1000.0)
+        result = await self._http_request(
+            "POST", url, timeout_profile="release"
+        )
 
         # Consider both 200 OK and 404 Not Found as "success" since in both cases
         # the lease is no longer active on the server
@@ -454,8 +523,6 @@ class KVServiceSMBackend(StorageBackendInterface):
             return None
 
         try:
-            # Read all data (single block is just multi-block with length=1)
-            total_data = bytearray()
             # Ensure shared_memory_map is not None (guaranteed by _ensure_shared_memory check above)  # noqa: E501
             if self.shared_memory_map is None:
                 logger.error(
@@ -463,53 +530,76 @@ class KVServiceSMBackend(StorageBackendInterface):
                 )
                 return None
 
+            metadata_size = REMOTE_METADATA_HEADER_BYTES
+            metadata_buffer = bytearray(metadata_size)
+            metadata_read = 0
+            data_segments: List[Tuple[int, int]] = []
+
             for offset, length in lease_info.offsets:
-                chunk = bytes(self.shared_memory_map[offset : offset + length])
-                total_data.extend(chunk)
+                remaining_meta = metadata_size - metadata_read
+                if remaining_meta > 0:
+                    read_now = min(length, remaining_meta)
+                    metadata_buffer[
+                        metadata_read : metadata_read + read_now
+                    ] = self.shared_memory_map[offset : offset + read_now]
+                    metadata_read += read_now
+                    offset += read_now
+                    length -= read_now
 
-            # Validate total size
-            if len(total_data) != lease_info.total_size:
+                if length > 0:
+                    if (
+                        data_segments
+                        and offset
+                        == data_segments[-1][0] + data_segments[-1][1]
+                    ):
+                        prev_offset, prev_length = data_segments[-1]
+                        data_segments[-1] = (prev_offset, prev_length + length)
+                    else:
+                        data_segments.append((offset, length))
+
+            if metadata_read != metadata_size:
                 logger.error(
-                    f"Size mismatch: expected {lease_info.total_size}, got {len(total_data)}"  # noqa: E501
+                    f"Insufficient data for metadata header: read {metadata_read} bytes"
                 )
-                return None
-
-            # Parse simple format: [RemoteMetadata struct][byte_array]
-            metadata_size = 4 * 7  # RemoteMetadata is 7 integers
-            if len(total_data) < metadata_size:
-                logger.error("Insufficient data for metadata header")
                 return None
 
             try:
-                # Parse using existing RemoteMetadata
-                metadata = RemoteMetadata.deserialize(total_data[:metadata_size])
-                kv_bytes = total_data[metadata_size : metadata_size + metadata.length]
-
-                if len(kv_bytes) != metadata.length:
-                    logger.error(
-                        f"Data size mismatch: expected {metadata.length}, "
-                        f"got {len(kv_bytes)}"
-                    )
-                    return None
-
-                # Simple reconstruction using existing allocator
-                return await self._create_simple_tensor_from_metadata(
-                    key, metadata, kv_bytes
-                )
-
+                metadata = RemoteMetadata.deserialize(metadata_buffer)
             except Exception as e:
                 logger.error(f"Failed to parse simple metadata: {e}")
                 return None
+
+            data_available = sum(length for _, length in data_segments)
+            if data_available < metadata.length:
+                logger.error(
+                    f"Data size mismatch: expected {metadata.length}, "
+                    f"got {data_available}"
+                )
+                return None
+
+            return await self._create_simple_tensor_from_metadata(
+                key, metadata, kv_bytes=None, data_segments=data_segments
+            )
 
         except Exception as e:
             logger.error(f"Error reading tensor from lease for key {key}: {e}")
             return None
 
     async def _create_simple_tensor_from_metadata(
-        self, key: CacheEngineKey, metadata: RemoteMetadata, kv_bytes: bytes
+        self,
+        key: CacheEngineKey,
+        metadata: RemoteMetadata,
+        kv_bytes: Optional[bytes] = None,
+        data_segments: Optional[List[Tuple[int, int]]] = None,
     ) -> Optional[MemoryObj]:
         """Simple tensor reconstruction using Redis-style approach."""
         try:
+            if kv_bytes is None and data_segments is None:
+                logger.error(
+                    f"No data provided for tensor reconstruction of key {key}"
+                )
+                return None
+
             # RemoteMetadata uses 4D padded shape - restore original shape
             # by removing trailing zeros
             original_shape = metadata.shape
@@ -534,16 +624,43 @@ class KVServiceSMBackend(StorageBackendInterface):
                 logger.error(f"Failed to allocate memory for key {key}")
                 return None
 
-            # Direct byte copy - no tensor conversion needed!
-            if isinstance(memory_obj.byte_array, memoryview):
-                view = memory_obj.byte_array
-                if view.format == "<B":
-                    view = view.cast("B")
-            else:
-                view = memoryview(memory_obj.byte_array)
+            loop = asyncio.get_running_loop()
 
-            # Copy data directly to byte array
-            view[: metadata.length] = kv_bytes
+            try:
+                if kv_bytes is not None:
+                    if len(kv_bytes) != metadata.length:
+                        logger.error(
+                            f"Data size mismatch: expected {metadata.length}, "
+                            f"got {len(kv_bytes)}"
+                        )
+                        return None
+
+                    await loop.run_in_executor(
+                        self.deserialize_pool,
+                        self._copy_bytes_into_memory_obj,
+                        memory_obj,
+                        metadata.length,
+                        kv_bytes,
+                    )
+                else:
+                    if self.shared_memory_map is None:
+                        logger.error(
+                            "Shared memory map unavailable during streaming reconstruction"
+                        )
+                        return None
+
+                    await loop.run_in_executor(
+                        self.deserialize_pool,
+                        self._copy_segments_into_memory_obj,
+                        memory_obj,
+                        metadata.length,
+                        tuple(data_segments or []),
+                    )
+            except Exception as copy_error:
+                logger.error(
+                    f"Error populating tensor bytes for key {key}: {copy_error}"
+                )
+                return None
 
             logger.debug(
                 f"Simple reconstruction: actual_shape={actual_shape}, "
@@ -642,6 +759,15 @@ class KVServiceSMBackend(StorageBackendInterface):
                 logger.info("Thread pool shutdown complete")
             except Exception as e:
                 logger.error(f"Error shutting down thread pool: {e}")
+            self.thread_pool = None
+
+        if self.deserialize_pool is not None:
+            try:
+                self.deserialize_pool.shutdown(wait=True)
+                logger.info("Deserialization pool shutdown complete")
+            except Exception as e:
+                logger.error(f"Error shutting down deserialization pool: {e}")
+            self.deserialize_pool = None
 
         # Note: No CUDA streams to cleanup in simple approach
 
@@ -666,18 +792,13 @@ class KVServiceSMBackend(StorageBackendInterface):
     # Helper methods
 
     def _key_to_string(self, key: CacheEngineKey) -> str:
-        """Convert CacheEngineKey to string format for HTTP API.
+        """Convert CacheEngineKey to an encoded string for HTTP usage."""
 
-        Use URL encoding for complete safety instead of character replacement.
-        This avoids conflicts with existing underscores in keys.
-        """
         # Standard
         import urllib.parse
 
         key_str = key.to_string()
-        encoded_key = urllib.parse.quote(key_str, safe="")
-        
-        return encoded_key
+        return urllib.parse.quote(key_str, safe="")
 
     def _memory_obj_to_bytes(self, memory_obj: MemoryObj) -> bytes:
         """Ultra-simple serialization using Redis-style approach.
@@ -725,3 +846,74 @@ class KVServiceSMBackend(StorageBackendInterface):
             f"data: {len(kv_bytes)})"
         )
         return result
+
+    @staticmethod
+    def _as_byte_view(buffer) -> memoryview:
+        """Return a byte-format memoryview, releasing intermediates when casting."""
+
+        view = memoryview(buffer)
+        if view.format not in {"B", "b"}:
+            cast_view = view.cast("B")
+            view.release()
+            view = cast_view
+        return view
+
+    def _copy_bytes_into_memory_obj(
+        self, memory_obj: MemoryObj, expected_length: int, kv_bytes
+    ) -> None:
+        """Populate a MemoryObj with contiguous bytes."""
+
+        target_view = self._as_byte_view(memory_obj.byte_array)
+        try:
+            source_view = self._as_byte_view(kv_bytes)
+            try:
+                if len(source_view) != expected_length:
+                    raise ValueError(
+                        f"Data size mismatch: expected {expected_length}, "
+                        f"got {len(source_view)}"
+                    )
+
+                target_view[:expected_length] = source_view[:expected_length]
+            finally:
+                source_view.release()
+        finally:
+            target_view.release()
+
+    def _copy_segments_into_memory_obj(
+        self,
+        memory_obj: MemoryObj,
+        expected_length: int,
+        data_segments: Tuple[Tuple[int, int], ...],
+    ) -> None:
+        """Copy shared-memory segments into the destination MemoryObj."""
+
+        target_view = self._as_byte_view(memory_obj.byte_array)
+        try:
+            shared_map = self.shared_memory_map
+            if shared_map is None:
+                raise RuntimeError("Shared memory map unavailable during reconstruction")
+
+            shared_view = self._as_byte_view(shared_map)
+            try:
+                cursor = 0
+                bytes_remaining = expected_length
+
+                for offset, length in data_segments:
+                    if bytes_remaining <= 0:
+                        break
+
+                    chunk_len = min(length, bytes_remaining)
+                    target_view[cursor : cursor + chunk_len] = shared_view[
+                        offset : offset + chunk_len
+                    ]
+                    cursor += chunk_len
+                    bytes_remaining -= chunk_len
+
+                if bytes_remaining != 0:
+                    raise ValueError(
+                        f"Streaming copy incomplete: {bytes_remaining} bytes remaining"
+                    )
+            finally:
+                shared_view.release()
+        finally:
+            target_view.release()

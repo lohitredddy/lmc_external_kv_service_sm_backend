@@ -30,6 +30,22 @@ extra_config:
   kv_service_sm_url: "http://localhost:9200"
 ```
 
+### Performance tuning
+
+The backend exposes several optional settings under `extra_config` to help tune
+large-scale deployments:
+
+| Key | Description | Default |
+| --- | ----------- | ------- |
+| `kv_service_sm_max_connections` | Total HTTP connection pool size. | `256` |
+| `kv_service_sm_max_connections_per_host` | Per-host connection concurrency. | `128` |
+| `kv_service_sm_serialization_threads` | Worker threads for tensor serialization. | `min(32, max(4, cpu_count))` |
+| `kv_service_sm_deserialization_threads` | Worker threads for reconstructing tensors pulled from shared memory leases. | `matches serialization threads` |
+
+Separate serialization/deserialization pools let you push PUT uploads and GET
+reconstructions in parallel without starving one workload at the expense of the
+other when running long-context batches.
+
 ## Development
 
 To build the package:
