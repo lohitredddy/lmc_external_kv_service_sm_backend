@@ -56,12 +56,12 @@ class _KVStream(payload.Payload):
     """
 
     def __init__(self, meta: bytes, buf_mv: memoryview, chunk_bytes: int):
-        super().__init__(None)
+        super().__init__(None, content_type="application/octet-stream")
         self._meta = meta
         self._buf = buf_mv
         self._step = max(1, int(chunk_bytes))
         # Expose size so aiohttp can set Content-Length (no chunked encoding)
-        self.size = len(self._meta) + len(self._buf)
+        self.size = len(self._meta) + buf_mv.nbytes
 
     async def write(self, writer):
         # metadata is tiny; write at once
@@ -69,8 +69,10 @@ class _KVStream(payload.Payload):
         # stream payload in slices to avoid large Python copies
         mv = self._buf
         step = self._step
-        for i in range(0, len(mv), step):
-            await writer.write(mv[i : i + step])
+        total = mv.nbytes
+        for start in range(0, total, step):
+            end = min(start + step, total)
+            await writer.write(mv[start:end])
 
 
 class KVServiceSMBackend(StorageBackendInterface):
@@ -155,6 +157,20 @@ class KVServiceSMBackend(StorageBackendInterface):
             max_workers=self.deserialization_threads,
             thread_name_prefix="kv-service-sm-deser",
         )
+
+        # Cached size of serialized RemoteMetadata headers. Fallback to the
+        # legacy fixed-width (7 * int32) layout if the runtime calculation
+        # fails for any reason so older daemons remain compatible.
+        try:
+            sample_metadata = RemoteMetadata(
+                0,
+                torch.Size([0, 0, 0, 0]),
+                torch.float32,
+                getattr(torch, "contiguous_format", 0),
+            )
+            self.metadata_header_bytes = len(sample_metadata.serialize())
+        except Exception:
+            self.metadata_header_bytes = 4 * 7
 
         self.lease_lock = threading.Lock()
         self.leases: Dict[CacheEngineKey, LeaseInfo] = {}
@@ -313,7 +329,7 @@ class KVServiceSMBackend(StorageBackendInterface):
         """Async PUT with zero-copy(ish) streaming: send [meta][payload] without concatenation."""
         serialization_start = None
         http_start = None
-        memory_released = False
+        buf_mv: Optional[memoryview] = None
 
         try:
             # Use original worker_id for cache storage
@@ -338,12 +354,7 @@ class KVServiceSMBackend(StorageBackendInterface):
             serialization_time = loop.time() - serialization_start
 
             # Prepare a *zero-copy view* over the existing payload buffer.
-            # We must keep memory_obj alive until the PUT finishes.
-            try:
-                buf_mv = memoryview(memory_obj.byte_array)
-            except TypeError:
-                # Fallback if allocator returned bytes-like but not buffer-protocol
-                buf_mv = memoryview(bytes(memory_obj.byte_array))
+            buf_mv = self._buffer_to_byte_view(memory_obj.byte_array)
 
             # Stream the HTTP body: [meta][payload] in slices; no giant concat.
             data = _KVStream(meta_bytes, buf_mv, self.put_chunk_bytes)
@@ -357,7 +368,7 @@ class KVServiceSMBackend(StorageBackendInterface):
 
             if result and result["status"] == 200:
                 logger.debug(
-                    f"Successfully stored key {key}: {len(meta_bytes) + len(buf_mv)} bytes, "
+                    f"Successfully stored key {key}: {len(meta_bytes) + buf_mv.nbytes} bytes, "
                     f"serialize: {serialization_time * 1000:.1f}ms, "
                     f"http: {http_time * 1000:.1f}ms"
                 )
@@ -367,13 +378,15 @@ class KVServiceSMBackend(StorageBackendInterface):
         except Exception as e:
             logger.exception(f"Exception during PUT for key {key}: {e}")
         finally:
-            # Now that the PUT completed/failed, safe to release the underlying buffer.
-            if not memory_released:
+            if buf_mv is not None:
                 try:
-                    memory_obj.ref_count_down()
-                except Exception:
+                    buf_mv.release()
+                except (AttributeError, BufferError):
                     pass
-                memory_released = True
+            try:
+                memory_obj.ref_count_down()
+            except Exception:
+                pass
             # Always cleanup task tracking
             with self.put_lock:
                 self.put_tasks.discard(key)
@@ -426,10 +439,44 @@ class KVServiceSMBackend(StorageBackendInterface):
             if not await self._ensure_shared_memory():
                 return None
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                self.deser_pool, self._materialize_from_lease_sync, key, lease_info
+            metadata = await loop.run_in_executor(
+                self.deser_pool, self._read_metadata_from_lease_sync, lease_info
             )
-            return result
+            if metadata is None:
+                return None
+
+            actual_shape = self._unpadded_shape(metadata.shape)
+            try:
+                memory_obj = self.memory_allocator.allocate(
+                    actual_shape, metadata.dtype, metadata.fmt
+                )
+            except Exception as exc:
+                logger.error(f"Failed to allocate memory for key {key}: {exc}")
+                return None
+
+            if memory_obj is None:
+                logger.error(f"Failed to allocate memory for key {key}")
+                return None
+
+            success = await loop.run_in_executor(
+                self.deser_pool,
+                self._copy_payload_from_lease_sync,
+                lease_info,
+                metadata.length,
+                memory_obj,
+            )
+            if not success:
+                try:
+                    memory_obj.ref_count_down()
+                except Exception:
+                    pass
+                return None
+
+            logger.debug(
+                f"Reconstructed key={key} shape={actual_shape} "
+                f"dtype={metadata.dtype} fmt={metadata.fmt}"
+            )
+            return memory_obj
         finally:
             # Step 3: Always release lease
             await self._release_lease(lease_info.lease_id)
@@ -496,76 +543,98 @@ class KVServiceSMBackend(StorageBackendInterface):
 
         return success
 
-    def _materialize_from_lease_sync(
-        self, key: CacheEngineKey, lease_info: LeaseInfo
-    ) -> Optional[MemoryObj]:
-        """Single-pass SHM→dest copy (no intermediate concat). Runs in deser thread."""
-        if self.shared_memory_map is None:
+    def _read_metadata_from_lease_sync(self, lease_info: LeaseInfo) -> Optional[RemoteMetadata]:
+        """Read and deserialize the RemoteMetadata header for a lease."""
+        mv = self.shared_memory_map
+        if mv is None:
             return None
         if not lease_info.offsets:
-            logger.error(f"No offsets in lease for key {key}")
+            logger.error("No offsets present in lease to read metadata header")
             return None
 
-        mv = self.shared_memory_map  # memoryview over SHM
-
-        # --- 1) Read fixed-size header into tiny scratch ---
-        # RemoteMetadata header is 7 int32 fields; keep protocol in sync if it changes.
-        HEADER_BYTES = 4 * 7
-        hdr = bytearray(HEADER_BYTES)
+        header = bytearray(self.metadata_header_bytes)
         filled = 0
         for off, ln in lease_info.offsets:
-            if filled >= HEADER_BYTES:
+            if filled >= self.metadata_header_bytes:
                 break
-            n = min(ln, HEADER_BYTES - filled)
-            hdr[filled : filled + n] = mv[off : off + n]
+            n = min(ln, self.metadata_header_bytes - filled)
+            header[filled : filled + n] = mv[off : off + n]
             filled += n
-        if filled < HEADER_BYTES:
-            logger.error("Insufficient data for metadata header")
-            return None
-        metadata = RemoteMetadata.deserialize(hdr)
 
-        # --- 2) Allocate destination with actual shape/dtype/format ---
-        # RemoteMetadata stores 4D padded shape; remove trailing zeros
-        original_shape = metadata.shape
-        actual_shape_list: List[int] = []
-        for dim in original_shape:
-            if dim == 0 and len(actual_shape_list) > 0:
+        if filled < self.metadata_header_bytes:
+            logger.error(
+                "Insufficient data for metadata header: "
+                f"expected {self.metadata_header_bytes}, got {filled}"
+            )
+            return None
+
+        try:
+            return RemoteMetadata.deserialize(header)
+        except Exception as exc:
+            logger.error(f"Failed to parse metadata header: {exc}")
+            return None
+
+    def _unpadded_shape(self, padded_shape: torch.Size) -> torch.Size:
+        """Remove trailing zero padding from a 4D RemoteMetadata shape."""
+        actual: List[int] = []
+        for dim in padded_shape:
+            if dim == 0 and actual:
                 break
-            actual_shape_list.append(dim)
-        actual_shape = (
-            torch.Size(actual_shape_list) if actual_shape_list else torch.Size([1])
-        )
-        mem = self.memory_allocator.allocate(actual_shape, metadata.dtype, metadata.fmt)
-        if mem is None:
-            logger.error(f"Failed to allocate memory for key {key}")
-            return None
+            actual.append(dim)
+        return torch.Size(actual) if actual else torch.Size([1])
 
-        # --- 3) Copy payload once: SHM slices → destination view ---
-        dst = memoryview(mem.byte_array)[: metadata.length]
-        written, payload_skip = 0, HEADER_BYTES
-        for off, ln in lease_info.offsets:
-            if payload_skip:
-                if ln <= payload_skip:
-                    payload_skip -= ln
+    def _copy_payload_from_lease_sync(
+        self, lease_info: LeaseInfo, payload_len: int, memory_obj: MemoryObj
+    ) -> bool:
+        """Copy payload bytes from shared memory offsets into ``memory_obj``."""
+        mv = self.shared_memory_map
+        if mv is None:
+            return False
+
+        dst_view: Optional[memoryview] = None
+        try:
+            dst_view = self._buffer_to_byte_view(memory_obj.byte_array)
+            if payload_len > dst_view.nbytes:
+                logger.error(
+                    "Data size mismatch: expected buffer >= %d, got %d",
+                    payload_len,
+                    dst_view.nbytes,
+                )
+                return False
+
+            written = 0
+            payload_skip = self.metadata_header_bytes
+            for off, ln in lease_info.offsets:
+                if payload_skip:
+                    if ln <= payload_skip:
+                        payload_skip -= ln
+                        continue
+                    off += payload_skip
+                    ln -= payload_skip
+                    payload_skip = 0
+                if ln <= 0:
                     continue
-                off += payload_skip
-                ln -= payload_skip
-                payload_skip = 0
-            if ln <= 0:
-                continue
-            n = min(ln, len(dst) - written)
-            dst[written : written + n] = mv[off : off + n]
-            written += n
-            if written == len(dst):
-                break
-        if written != len(dst):
-            logger.error(f"Size mismatch: expected {len(dst)}, wrote {written}")
-            return None
+                remaining = payload_len - written
+                if remaining <= 0:
+                    break
+                n = min(ln, remaining)
+                dst_view[written : written + n] = mv[off : off + n]
+                written += n
 
-        logger.debug(
-            f"Reconstructed key={key} shape={actual_shape} dtype={metadata.dtype} fmt={metadata.fmt}"
-        )
-        return mem
+            if written != payload_len:
+                logger.error(
+                    "Size mismatch while copying payload: expected %d, wrote %d",
+                    payload_len,
+                    written,
+                )
+                return False
+            return True
+        finally:
+            if dst_view is not None:
+                try:
+                    dst_view.release()
+                except (AttributeError, BufferError):
+                    pass
 
     async def _ensure_shared_memory(self) -> bool:
         """Ensure shared memory is initialized and accessible."""
@@ -699,6 +768,59 @@ class KVServiceSMBackend(StorageBackendInterface):
 
         return encoded_key
 
+    def _buffer_nbytes(self, buffer) -> int:
+        """Return the number of bytes exposed by a buffer-compatible object.
+
+        Falls back to copying via ``bytes()`` if the object does not implement the
+        buffer protocol.
+        """
+        try:
+            mv = memoryview(buffer)
+        except TypeError:
+            return len(bytes(buffer))
+
+        try:
+            return mv.nbytes
+        finally:
+            try:
+                mv.release()
+            except (AttributeError, BufferError):
+                pass
+
+    def _buffer_to_byte_view(self, buffer) -> memoryview:
+        """Return a 1-D unsigned-byte memoryview over ``buffer``.
+
+        Attempts to avoid copies by casting contiguous buffers to ``'B'``.
+        When casting fails (e.g., non-contiguous exports), falls back to copying
+        the data into a new ``bytes`` object.
+        """
+        try:
+            mv = memoryview(buffer)
+        except TypeError:
+            return memoryview(bytes(buffer))
+
+        if mv.format in ("B", "b") and mv.ndim == 1 and getattr(mv, "c_contiguous", True):
+            return mv
+
+        try:
+            cast_mv = mv.cast("B")
+        except (TypeError, ValueError):
+            cast_mv = None
+
+        if cast_mv is not None and getattr(cast_mv, "c_contiguous", True):
+            try:
+                mv.release()
+            except (AttributeError, BufferError):
+                pass
+            return cast_mv
+
+        data = mv.tobytes()
+        try:
+            mv.release()
+        except (AttributeError, BufferError):
+            pass
+        return memoryview(data)
+
     def _metadata_only_bytes(self, memory_obj: MemoryObj) -> bytes:
         """Return just the RemoteMetadata header bytes (no payload).
 
@@ -710,10 +832,7 @@ class KVServiceSMBackend(StorageBackendInterface):
         memory_format = memory_obj.get_memory_format()
 
         # Compute payload length from current buffer view
-        try:
-            payload_len = len(memoryview(memory_obj.byte_array))
-        except TypeError:
-            payload_len = len(bytes(memory_obj.byte_array))
+        payload_len = self._buffer_nbytes(memory_obj.byte_array)
 
         # RemoteMetadata expects 4D shape; pad/truncate accordingly
         padded_shape = list(kv_shape) + [0] * (4 - len(kv_shape))
