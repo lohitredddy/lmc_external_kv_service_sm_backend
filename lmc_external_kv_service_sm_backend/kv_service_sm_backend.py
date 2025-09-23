@@ -96,18 +96,35 @@ class KVServiceSMBackend(StorageBackendInterface):
         self.put_timeout_ms = extra_config.get("kv_service_sm_put_timeout_ms", 5000)
         self.release_timeout_ms = extra_config.get("kv_service_sm_release_timeout_ms", 2000)
 
-        # Performance optimizations for scale
+        # Performance optimizations for scale - deprecated but kept for backward compatibility
         self.max_connections = extra_config.get("kv_service_sm_max_connections", 256)
         self.max_connections_per_host = extra_config.get(
             "kv_service_sm_max_connections_per_host", 128
         )
+        
+        # Separate connection pool configurations for lease and PUT operations
+        self.lease_max_connections = extra_config.get(
+            "kv_service_sm_lease_max_connections", 128
+        )
+        self.lease_max_connections_per_host = extra_config.get(
+            "kv_service_sm_lease_max_connections_per_host", 64
+        )
+        self.put_max_connections = extra_config.get(
+            "kv_service_sm_put_max_connections", 64
+        )
+        self.put_max_connections_per_host = extra_config.get(
+            "kv_service_sm_put_max_connections_per_host", 32
+        )
+        
         self.serialization_threads = extra_config.get(
             "kv_service_sm_serialization_threads", 16
         )
 
-        # HTTP connection pool for high-scale performance
-        self.http_session: Optional[aiohttp.ClientSession] = None
-        self.session_lock = asyncio.Lock()
+        # Separate HTTP sessions for lease and PUT operations
+        self.lease_http_session: Optional[aiohttp.ClientSession] = None
+        self.put_http_session: Optional[aiohttp.ClientSession] = None
+        self.lease_session_lock = asyncio.Lock()
+        self.put_session_lock = asyncio.Lock()
 
         # Thread pool for CPU-bound serialization operations
         self.thread_pool = ThreadPoolExecutor(
@@ -133,8 +150,8 @@ class KVServiceSMBackend(StorageBackendInterface):
         logger.info(
             f"KVServiceSMBackend initialized with URL: {self.base_url}, "
             f"bucket: {self.bucket_name}, shared_memory: {self.shared_memory_name}, "
-            f"max_connections: {self.max_connections}, "
-            f"max_connections_per_host: {self.max_connections_per_host}, "
+            f"lease connections: {self.lease_max_connections} (per-host: {self.lease_max_connections_per_host}), "
+            f"put connections: {self.put_max_connections} (per-host: {self.put_max_connections_per_host}), "
             f"serialization_threads: {self.serialization_threads}, "
             f"timeouts (ms): lease={self.lease_timeout_ms}, "
             f"put={self.put_timeout_ms}, release={self.release_timeout_ms}"
@@ -205,43 +222,91 @@ class KVServiceSMBackend(StorageBackendInterface):
         )
         return None
 
-    async def _ensure_http_session(self) -> aiohttp.ClientSession:
-        """Ensure HTTP session with connection pooling is initialized."""
-        if self.http_session is None:
-            async with self.session_lock:
-                if self.http_session is None:  # Double-check locking
-                    connector = aiohttp.TCPConnector(
-                        limit=self.max_connections,  # Total connection pool size
-                        limit_per_host=self.max_connections_per_host,  # Per-host connection limit  # noqa: E501
-                        ttl_dns_cache=300,  # DNS cache TTL (5 min)
-                        use_dns_cache=True,  # Enable DNS caching
-                        keepalive_timeout=30,  # Keep connections alive
-                        enable_cleanup_closed=True,  # Clean up closed connections
-                    )
+    async def _ensure_http_session(self, session_type: str = "lease") -> aiohttp.ClientSession:
+        """Ensure HTTP session with connection pooling is initialized.
+        
+        Args:
+            session_type: Either "lease" or "put" to get the appropriate session
+        """
+        if session_type == "put":
+            if self.put_http_session is None:
+                async with self.put_session_lock:
+                    if self.put_http_session is None:  # Double-check locking
+                        connector = aiohttp.TCPConnector(
+                            limit=self.put_max_connections,
+                            limit_per_host=self.put_max_connections_per_host,
+                            ttl_dns_cache=300,  # DNS cache TTL (5 min)
+                            use_dns_cache=True,  # Enable DNS caching
+                            keepalive_timeout=15,  # Shorter keepalive for PUT connections
+                            enable_cleanup_closed=True,  # Clean up closed connections
+                        )
 
-                    timeout = aiohttp.ClientTimeout(
-                        total=30,  # Total timeout for request
-                        connect=5,  # Connection timeout
-                        sock_read=10,  # Socket read timeout
-                    )
+                        timeout = aiohttp.ClientTimeout(
+                            total=30,  # Total timeout for request
+                            connect=5,  # Connection timeout
+                            sock_read=10,  # Socket read timeout
+                        )
 
-                    self.http_session = aiohttp.ClientSession(
-                        connector=connector,
-                        timeout=timeout,
-                        headers={"User-Agent": "LMCache-KVServiceSMBackend/1.0"},
-                    )
-                    logger.info(
-                        f"Created HTTP session with {self.max_connections} max connections"  # noqa: E501
-                    )
+                        self.put_http_session = aiohttp.ClientSession(
+                            connector=connector,
+                            timeout=timeout,
+                            headers={"User-Agent": "LMCache-KVServiceSMBackend/1.0"},
+                        )
+                        logger.info(
+                            f"Created PUT HTTP session with {self.put_max_connections} max connections, "
+                            f"{self.put_max_connections_per_host} per host"
+                        )
 
-        return self.http_session
+            return self.put_http_session
+        else:  # Default to lease session
+            if self.lease_http_session is None:
+                async with self.lease_session_lock:
+                    if self.lease_http_session is None:  # Double-check locking
+                        connector = aiohttp.TCPConnector(
+                            limit=self.lease_max_connections,
+                            limit_per_host=self.lease_max_connections_per_host,
+                            ttl_dns_cache=300,  # DNS cache TTL (5 min)
+                            use_dns_cache=True,  # Enable DNS caching
+                            keepalive_timeout=60,  # Longer keepalive for lease connections
+                            enable_cleanup_closed=True,  # Clean up closed connections
+                        )
+
+                        timeout = aiohttp.ClientTimeout(
+                            total=30,  # Total timeout for request
+                            connect=5,  # Connection timeout
+                            sock_read=10,  # Socket read timeout
+                        )
+
+                        self.lease_http_session = aiohttp.ClientSession(
+                            connector=connector,
+                            timeout=timeout,
+                            headers={"User-Agent": "LMCache-KVServiceSMBackend/1.0"},
+                        )
+                        logger.info(
+                            f"Created Lease HTTP session with {self.lease_max_connections} max connections, "
+                            f"{self.lease_max_connections_per_host} per host"
+                        )
+
+            return self.lease_http_session
 
     async def _http_request(
         self, method: str, url: str, data=None, params=None, timeout=5.0
     ):
-        """Optimized HTTP request with connection pooling."""
+        """Optimized HTTP request with connection pooling.
+        
+        Automatically routes to the appropriate session based on operation type:
+        - PUT operations -> put_http_session
+        - Lease operations (acquire/release) -> lease_http_session
+        """
         try:
-            session = await self._ensure_http_session()
+            # Determine session type based on operation
+            if method == "PUT":
+                session_type = "put"
+            else:
+                # All other operations (lease acquire, release, etc.) use lease session
+                session_type = "lease"
+            
+            session = await self._ensure_http_session(session_type)
             request_timeout = aiohttp.ClientTimeout(total=timeout)
 
             async with session.request(
@@ -623,17 +688,28 @@ class KVServiceSMBackend(StorageBackendInterface):
         except Exception as e:
             logger.error(f"Error releasing key leases: {e}")
 
-        # Close HTTP session and connection pool
-        if self.http_session is not None:
+        # Close both HTTP sessions and their connection pools
+        if self.lease_http_session is not None:
             try:
                 # Schedule closure on the event loop
                 asyncio.run_coroutine_threadsafe(
-                    self.http_session.close(), self.loop
+                    self.lease_http_session.close(), self.loop
                 ).result(timeout=5.0)
-                logger.info("HTTP session closed")
+                logger.info("Lease HTTP session closed")
             except Exception as e:
-                logger.error(f"Error closing HTTP session: {e}")
-            self.http_session = None
+                logger.error(f"Error closing lease HTTP session: {e}")
+            self.lease_http_session = None
+
+        if self.put_http_session is not None:
+            try:
+                # Schedule closure on the event loop
+                asyncio.run_coroutine_threadsafe(
+                    self.put_http_session.close(), self.loop
+                ).result(timeout=5.0)
+                logger.info("PUT HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing PUT HTTP session: {e}")
+            self.put_http_session = None
 
         # Shutdown thread pool
         if self.thread_pool is not None:
