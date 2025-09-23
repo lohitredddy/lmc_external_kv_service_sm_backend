@@ -20,6 +20,7 @@ from multiprocessing import shared_memory
 from typing import Dict, List, Optional, Tuple
 import asyncio
 import threading
+import time
 
 # Third Party
 import aiohttp
@@ -37,6 +38,79 @@ from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 
 logger = init_logger(__name__)
+
+
+class ProfileStats:
+    """Simple direct logging profiler for KVServiceSM operations - no state, no locks."""
+    
+    def __init__(self, enabled: bool = True, log_interval_ops: int = None):
+        self.enabled = enabled
+        # log_interval_ops is kept for backward compatibility but ignored
+        
+    def record_operation(self, op_type: str, duration_ms: float, phases: Dict[str, float] = None):
+        """Log operation directly - no state tracking."""
+        if not self.enabled:
+            return
+        
+        # Build phase string if phases provided
+        phase_str = ""
+        if phases:
+            phase_parts = [f"{k}: {v:.1f}ms" for k, v in phases.items()]
+            phase_str = f" [{', '.join(phase_parts)}]"
+        
+        # Direct log with no state
+        logger.info(f"KVServiceSM {op_type}: {duration_ms:.1f}ms{phase_str}")
+                
+    def record_queue_depth(self, depth: int, connection_wait_ms: float = 0):
+        """Log queue depth directly."""
+        if not self.enabled:
+            return
+            
+        if connection_wait_ms > 0:
+            logger.info(f"KVServiceSM queue_depth: {depth}, connection_wait: {connection_wait_ms:.1f}ms")
+        else:
+            logger.info(f"KVServiceSM queue_depth: {depth}")
+                
+    def record_cache_hit(self, hit: bool):
+        """Log cache hit/miss directly."""
+        if not self.enabled:
+            return
+            
+        logger.info(f"KVServiceSM cache: {'HIT' if hit else 'MISS'}")
+                
+    def record_timeout(self):
+        """Log timeout directly."""
+        if not self.enabled:
+            return
+            
+        logger.info("KVServiceSM operation TIMEOUT")
+        
+    def log_stats(self):
+        """No-op for compatibility - we don't accumulate stats anymore."""
+        pass
+
+
+class ProfileTimer:
+    """Context manager for timing operations."""
+    
+    def __init__(self, stats: ProfileStats, op_type: str, phases_dict: Dict[str, float] = None):
+        self.stats = stats
+        self.op_type = op_type
+        self.phases_dict = phases_dict or {}
+        self.start_time = None
+        
+    def __enter__(self):
+        self.start_time = time.perf_counter()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.start_time:
+            duration_ms = (time.perf_counter() - self.start_time) * 1000
+            self.stats.record_operation(self.op_type, duration_ms, self.phases_dict)
+            
+    def record_phase(self, phase_name: str, duration_ms: float):
+        """Record a phase timing."""
+        self.phases_dict[phase_name] = duration_ms
 
 
 @dataclass
@@ -105,8 +179,10 @@ class KVServiceSMBackend(StorageBackendInterface):
             "kv_service_sm_serialization_threads", 16
         )
 
-        # HTTP connection pool for high-scale performance
-        self.http_session: Optional[aiohttp.ClientSession] = None
+        # Separate HTTP connection pools for different operation types
+        # This prevents long-running PUTs from starving time-critical lease operations
+        self.put_session: Optional[aiohttp.ClientSession] = None
+        self.lease_session: Optional[aiohttp.ClientSession] = None
         self.session_lock = asyncio.Lock()
 
         # Thread pool for CPU-bound serialization operations
@@ -128,6 +204,14 @@ class KVServiceSMBackend(StorageBackendInterface):
         self.shared_memory_map: Optional[memoryview] = None
         self.shared_memory_lock = threading.Lock()
 
+        # Profiling configuration
+        profiling_enabled = extra_config.get("kv_service_sm_enable_profiling", True)
+        profiling_log_interval = extra_config.get("kv_service_sm_profiling_log_interval", 1000)
+        self.profile_stats = ProfileStats(
+            enabled=profiling_enabled,
+            log_interval_ops=profiling_log_interval
+        )
+
         # Note: No CUDA streams needed for simple byte array approach
 
         logger.info(
@@ -137,7 +221,8 @@ class KVServiceSMBackend(StorageBackendInterface):
             f"max_connections_per_host: {self.max_connections_per_host}, "
             f"serialization_threads: {self.serialization_threads}, "
             f"timeouts (ms): lease={self.lease_timeout_ms}, "
-            f"put={self.put_timeout_ms}, release={self.release_timeout_ms}"
+            f"put={self.put_timeout_ms}, release={self.release_timeout_ms}, "
+            f"profiling: {'enabled' if profiling_enabled else 'disabled'}"
         )
 
     def __str__(self):
@@ -145,6 +230,9 @@ class KVServiceSMBackend(StorageBackendInterface):
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         """Check if key exists in KVServiceSM cache."""
+        start_time = time.perf_counter()
+        phases = {}
+        
         try:
             # Use original worker_id for cache lookup
             lookup_key = CacheEngineKey(
@@ -156,21 +244,38 @@ class KVServiceSMBackend(StorageBackendInterface):
                 key.request_configs,
             )
 
-            # DEBUG: Log the cache key lookup details
+            # Check local lease cache first
             key_str = self._key_to_string(lookup_key)
             if lookup_key in self.leases:
                 logger.debug(f"Key found in local leases - CACHE HIT")
+                self.profile_stats.record_cache_hit(True)
+                duration_ms = (time.perf_counter() - start_time) * 1000
+                self.profile_stats.record_operation("contains_local_hit", duration_ms)
                 return True
 
+            # Need to acquire lease from remote
+            lease_start = time.perf_counter()
             lease_info = asyncio.run_coroutine_threadsafe(
                 self._acquire_lease(lookup_key), self.loop
             ).result()
+            phases["lease_acquire"] = (time.perf_counter() - lease_start) * 1000
 
             result = lease_info is not None
+            self.profile_stats.record_cache_hit(result)
+            
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            self.profile_stats.record_operation(
+                "contains_remote" if result else "contains_miss", 
+                duration_ms, 
+                phases
+            )
+            
             logger.debug(f"Lease acquisition result: {'SUCCESS' if result else 'FAILED'}")
             return result
         except Exception as e:
             logger.error(f"Exception during key existence check: {e}")
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            self.profile_stats.record_operation("contains_error", duration_ms)
             return False
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -205,43 +310,101 @@ class KVServiceSMBackend(StorageBackendInterface):
         )
         return None
 
-    async def _ensure_http_session(self) -> aiohttp.ClientSession:
-        """Ensure HTTP session with connection pooling is initialized."""
-        if self.http_session is None:
-            async with self.session_lock:
-                if self.http_session is None:  # Double-check locking
-                    connector = aiohttp.TCPConnector(
-                        limit=self.max_connections,  # Total connection pool size
-                        limit_per_host=self.max_connections_per_host,  # Per-host connection limit  # noqa: E501
-                        ttl_dns_cache=300,  # DNS cache TTL (5 min)
-                        use_dns_cache=True,  # Enable DNS caching
-                        keepalive_timeout=30,  # Keep connections alive
-                        enable_cleanup_closed=True,  # Clean up closed connections
-                    )
+    async def _ensure_http_sessions(self, operation_type: str = "lease") -> aiohttp.ClientSession:
+        """Ensure separate HTTP sessions for PUT and lease operations are initialized.
+        
+        Args:
+            operation_type: "put" or "lease" to select appropriate session
+            
+        Returns:
+            The appropriate aiohttp.ClientSession for the operation type
+        """
+        async with self.session_lock:
+            # Create PUT session if needed - uses larger connection limits
+            if self.put_session is None:
+                # PUT operations get 70% of connections since they're typically more numerous
+                put_connections = int(self.max_connections * 0.7)
+                put_per_host = int(self.max_connections_per_host * 0.7)
+                
+                put_connector = aiohttp.TCPConnector(
+                    limit=put_connections,
+                    limit_per_host=put_per_host,
+                    ttl_dns_cache=300,
+                    use_dns_cache=True,
+                    keepalive_timeout=30,
+                    enable_cleanup_closed=True,
+                )
 
-                    timeout = aiohttp.ClientTimeout(
-                        total=30,  # Total timeout for request
-                        connect=5,  # Connection timeout
-                        sock_read=10,  # Socket read timeout
-                    )
+                put_timeout = aiohttp.ClientTimeout(
+                    total=30,  # Longer timeout for PUT operations
+                    connect=5,
+                    sock_read=10,
+                )
 
-                    self.http_session = aiohttp.ClientSession(
-                        connector=connector,
-                        timeout=timeout,
-                        headers={"User-Agent": "LMCache-KVServiceSMBackend/1.0"},
-                    )
-                    logger.info(
-                        f"Created HTTP session with {self.max_connections} max connections"  # noqa: E501
-                    )
+                self.put_session = aiohttp.ClientSession(
+                    connector=put_connector,
+                    timeout=put_timeout,
+                    headers={"User-Agent": "LMCache-KVServiceSMBackend/1.0-PUT"},
+                )
+                logger.info(
+                    f"Created PUT session with {put_connections} connections "
+                    f"({put_per_host} per host)"
+                )
 
-        return self.http_session
+            # Create lease session if needed - uses smaller pool but faster timeouts
+            if self.lease_session is None:
+                # Lease operations get 30% of connections but with tighter timeouts
+                lease_connections = int(self.max_connections * 0.3)
+                lease_per_host = int(self.max_connections_per_host * 0.3)
+                
+                lease_connector = aiohttp.TCPConnector(
+                    limit=lease_connections,
+                    limit_per_host=lease_per_host,
+                    ttl_dns_cache=300,
+                    use_dns_cache=True,
+                    keepalive_timeout=30,
+                    enable_cleanup_closed=True,
+                )
+
+                # Tighter timeouts for lease operations
+                lease_timeout = aiohttp.ClientTimeout(
+                    total=5,  # Much shorter timeout
+                    connect=2,  # Faster connect timeout
+                    sock_read=3,  # Faster read timeout
+                )
+
+                self.lease_session = aiohttp.ClientSession(
+                    connector=lease_connector,
+                    timeout=lease_timeout,
+                    headers={"User-Agent": "LMCache-KVServiceSMBackend/1.0-LEASE"},
+                )
+                logger.info(
+                    f"Created LEASE session with {lease_connections} connections "
+                    f"({lease_per_host} per host)"
+                )
+        
+        # Return the appropriate session
+        if operation_type == "put":
+            return self.put_session
+        else:
+            return self.lease_session
 
     async def _http_request(
-        self, method: str, url: str, data=None, params=None, timeout=5.0
+        self, method: str, url: str, data=None, params=None, timeout=5.0, 
+        operation_type: str = "lease"
     ):
-        """Optimized HTTP request with connection pooling."""
+        """Optimized HTTP request with separate connection pools for PUT vs lease operations.
+        
+        Args:
+            operation_type: "put" or "lease" to select appropriate connection pool
+        """
         try:
-            session = await self._ensure_http_session()
+            # Select appropriate session based on operation type
+            if operation_type == "put":
+                session = await self._ensure_http_sessions("put")
+            else:
+                session = await self._ensure_http_sessions("lease")
+                
             request_timeout = aiohttp.ClientTimeout(total=timeout)
 
             async with session.request(
@@ -258,23 +421,29 @@ class KVServiceSMBackend(StorageBackendInterface):
                 }
                 return result
         except asyncio.TimeoutError:
-            logger.warning(f"HTTP {method} request timeout for {url} (timeout: {timeout}s)")
+            logger.warning(f"HTTP {method} request timeout for {url} (timeout: {timeout}s, pool: {operation_type})")
             return None
         except aiohttp.ClientError as e:
-            logger.error(f"HTTP {method} client error for {url}: {e}")
+            logger.error(f"HTTP {method} client error for {url} (pool: {operation_type}): {e}")
             return None
         except Exception as e:
-            logger.error(f"HTTP {method} request failed for {url}: {e}")
+            logger.error(f"HTTP {method} request failed for {url} (pool: {operation_type}): {e}")
             return None
 
     @_lmcache_nvtx_annotate
     async def _async_put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         """Optimized async PUT operation with thread pool for serialization and early memory release."""  # noqa: E501
-        serialization_start = None
-        http_start = None
+        operation_start = time.perf_counter()
+        phases = {}
         memory_released = False
+        success = False
 
         try:
+            # Record queue depth before operation
+            with self.put_lock:
+                queue_depth = len(self.put_tasks)
+            self.profile_stats.record_queue_depth(queue_depth)
+
             # Use original worker_id for cache storage
             store_key = CacheEngineKey(
                 key.fmt,
@@ -294,27 +463,33 @@ class KVServiceSMBackend(StorageBackendInterface):
             data = await loop.run_in_executor(
                 self.thread_pool, self._memory_obj_to_bytes, memory_obj
             )
-            serialization_time = loop.time() - serialization_start
+            serialization_time = (loop.time() - serialization_start) * 1000
+            phases["serialize"] = serialization_time
 
             # OPTIMIZATION 2: Early memory release - tensor copied to bytes, release GPU memory  # noqa: E501
             memory_obj.ref_count_down()
             memory_released = True
 
-            # HTTP request on event loop (I/O-bound operation)
+            # HTTP request on event loop (I/O-bound operation) - use PUT pool
             http_start = loop.time()
             result = await self._http_request(
-                "PUT", url, data=data, timeout=self.put_timeout_ms / 1000.0
+                "PUT", url, data=data, timeout=self.put_timeout_ms / 1000.0,
+                operation_type="put"
             )
-            http_time = loop.time() - http_start
+            http_time = (loop.time() - http_start) * 1000
+            phases["http"] = http_time
 
             if result and result["status"] == 200:
+                success = True
                 logger.debug(
                     f"Successfully stored key {key}: {len(data)} bytes, "
-                    f"serialize: {serialization_time * 1000:.1f}ms, "
-                    f"http: {http_time * 1000:.1f}ms"
+                    f"serialize: {serialization_time:.1f}ms, "
+                    f"http: {http_time:.1f}ms"
                 )
             else:
                 status = result["status"] if result else "TIMEOUT"
+                if not result:
+                    self.profile_stats.record_timeout()
                 logger.error(f"Failed to store key {key}: HTTP {status}")
         except Exception as e:
             logger.exception(f"Exception during PUT for key {key}: {e}")
@@ -328,6 +503,14 @@ class KVServiceSMBackend(StorageBackendInterface):
             # Always cleanup task tracking
             with self.put_lock:
                 self.put_tasks.discard(key)
+            
+            # Record operation timing
+            duration_ms = (time.perf_counter() - operation_start) * 1000
+            self.profile_stats.record_operation(
+                f"put_{'success' if success else 'fail'}", 
+                duration_ms, 
+                phases
+            )
 
     def submit_prefetch_task(self, key: CacheEngineKey) -> Optional[Future]:
         """Submit prefetch task - unified with other GET operations."""
@@ -349,6 +532,9 @@ class KVServiceSMBackend(StorageBackendInterface):
 
     async def _get_memory_obj(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Unified GET method: lease → read → reconstruct → release."""
+        operation_start = time.perf_counter()
+        phases = {}
+        
         # Use original worker_id for cache operations
         lookup_key = CacheEngineKey(
             key.fmt,
@@ -360,25 +546,50 @@ class KVServiceSMBackend(StorageBackendInterface):
         )
         
         lease_info = None
-
-        # Step 1: Acquire lease
-        with self.lease_lock:
-            if lookup_key in self.leases:
-                lease_info = self.leases.get(lookup_key)
-
-        if lease_info is None:
-            lease_info = await self._acquire_lease(lookup_key)
-
-        if lease_info is None:
-            return None
+        result = None
 
         try:
+            # Step 1: Acquire lease
+            lease_start = time.perf_counter()
+            with self.lease_lock:
+                if lookup_key in self.leases:
+                    lease_info = self.leases.get(lookup_key)
+                    phases["lease_cached"] = 0.001  # Near-zero for cached lease
+
+            if lease_info is None:
+                lease_info = await self._acquire_lease(lookup_key)
+                phases["lease_acquire"] = (time.perf_counter() - lease_start) * 1000
+
+            if lease_info is None:
+                duration_ms = (time.perf_counter() - operation_start) * 1000
+                self.profile_stats.record_operation("get_miss", duration_ms, phases)
+                return None
+
             # Step 2: Read and reconstruct tensor from shared memory
+            read_start = time.perf_counter()
             result = await self._read_tensor_from_lease(key, lease_info)
+            phases["read_reconstruct"] = (time.perf_counter() - read_start) * 1000
+            
+            # Record success/failure
+            duration_ms = (time.perf_counter() - operation_start) * 1000
+            self.profile_stats.record_operation(
+                f"get_{'success' if result else 'fail'}", 
+                duration_ms, 
+                phases
+            )
+            
             return result
+        except Exception as e:
+            logger.error(f"Exception in _get_memory_obj for key {key}: {e}")
+            duration_ms = (time.perf_counter() - operation_start) * 1000
+            self.profile_stats.record_operation("get_error", duration_ms, phases)
+            return None
         finally:
             # Step 3: Always release lease
-            await self._release_lease(lease_info.lease_id)
+            if lease_info:
+                release_start = time.perf_counter()
+                await self._release_lease(lease_info.lease_id)
+                phases["lease_release"] = (time.perf_counter() - release_start) * 1000
 
     async def _acquire_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
         """Acquire a lease for the given key from KVServiceSM daemon."""
@@ -389,7 +600,8 @@ class KVServiceSMBackend(StorageBackendInterface):
         logger.debug(f"Acquiring lease for key {key_str} with timeout {self.lease_timeout_ms}ms")
 
         result = await self._http_request(
-            "POST", url, params=params, timeout=self.lease_timeout_ms / 1000.0
+            "POST", url, params=params, timeout=self.lease_timeout_ms / 1000.0,
+            operation_type="lease"
         )
 
         if result and result["status"] == 200 and result["json"]:
@@ -412,7 +624,10 @@ class KVServiceSMBackend(StorageBackendInterface):
 
     async def _release_lease(self, lease_id: str) -> bool:
         url = f"{self.base_url}/v1/leases/{lease_id}/release"
-        result = await self._http_request("POST", url, timeout=self.release_timeout_ms / 1000.0)
+        result = await self._http_request(
+            "POST", url, timeout=self.release_timeout_ms / 1000.0,
+            operation_type="lease"
+        )
 
         # Consider both 200 OK and 404 Not Found as "success" since in both cases
         # the lease is no longer active on the server
@@ -623,17 +838,28 @@ class KVServiceSMBackend(StorageBackendInterface):
         except Exception as e:
             logger.error(f"Error releasing key leases: {e}")
 
-        # Close HTTP session and connection pool
-        if self.http_session is not None:
+        # Close both HTTP sessions and connection pools
+        if self.put_session is not None:
             try:
                 # Schedule closure on the event loop
                 asyncio.run_coroutine_threadsafe(
-                    self.http_session.close(), self.loop
+                    self.put_session.close(), self.loop
                 ).result(timeout=5.0)
-                logger.info("HTTP session closed")
+                logger.info("PUT HTTP session closed")
             except Exception as e:
-                logger.error(f"Error closing HTTP session: {e}")
-            self.http_session = None
+                logger.error(f"Error closing PUT HTTP session: {e}")
+            self.put_session = None
+            
+        if self.lease_session is not None:
+            try:
+                # Schedule closure on the event loop
+                asyncio.run_coroutine_threadsafe(
+                    self.lease_session.close(), self.loop
+                ).result(timeout=5.0)
+                logger.info("Lease HTTP session closed")
+            except Exception as e:
+                logger.error(f"Error closing Lease HTTP session: {e}")
+            self.lease_session = None
 
         # Shutdown thread pool
         if self.thread_pool is not None:
