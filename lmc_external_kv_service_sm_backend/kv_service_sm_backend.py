@@ -19,7 +19,9 @@ from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Dict, List, Optional, Tuple
 import asyncio
+import logging
 import threading
+import time
 
 # Third Party
 import aiohttp
@@ -78,7 +80,6 @@ class KVServiceSMBackend(StorageBackendInterface):
 
         self.config = config
         self.metadata = metadata
-        self.loop = loop
         self.memory_allocator = memory_allocator
         self.local_cpu_backend = local_cpu_backend
         self.lookup_server = lookup_server
@@ -105,9 +106,12 @@ class KVServiceSMBackend(StorageBackendInterface):
             "kv_service_sm_serialization_threads", 16
         )
 
-        # HTTP connection pool for high-scale performance
-        self.http_session: Optional[aiohttp.ClientSession] = None
-        self.session_lock = asyncio.Lock()
+        # --- HTTP connection pools (SPLIT: control vs bulk) ---
+        # control = tiny, latency-sensitive ops (leases/releases)
+        # bulk    = heavy PUT uploads
+        self.http_session_control: Optional[aiohttp.ClientSession] = None
+        self.http_session_bulk: Optional[aiohttp.ClientSession] = None
+        self.session_lock = threading.Lock()  # protects both sessions
 
         # Thread pool for CPU-bound serialization operations
         self.thread_pool = ThreadPoolExecutor(
@@ -122,6 +126,22 @@ class KVServiceSMBackend(StorageBackendInterface):
         # Put task tracking - required by interface
         self.put_lock = threading.Lock()
         self.put_tasks: set[CacheEngineKey] = set()
+
+        # --- Hot-path caches & single-flight structures ---
+        self._neg_ttl_ms = extra_config.get("kv_service_sm_neg_ttl_ms", 100)   # short negative cache
+        self._pos_ttl_ms = extra_config.get("kv_service_sm_pos_ttl_ms", 250)   # brief positive cache
+        self._neg: Dict[str, int] = {}  # encoded_key -> expires_ms
+        self._pos: Dict[str, int] = {}  # encoded_key -> expires_ms
+        self._neg_lock = threading.Lock()
+        self._pos_lock = threading.Lock()
+
+        # Coalesce concurrent lease acquisitions for the same key
+        self._inflight: Dict[str, Future] = {}
+        self._inflight_lock = threading.Lock()
+
+        # Cache encoded key strings (avoid repeated urllib.quote + to_string)
+        self._keystr_cache: Dict[CacheEngineKey, str] = {}
+        self._keystr_lock = threading.Lock()
 
         # Shared memory mapping (lazy initialization)
         self.shared_memory_obj: Optional[shared_memory.SharedMemory] = None
@@ -140,6 +160,27 @@ class KVServiceSMBackend(StorageBackendInterface):
             f"put={self.put_timeout_ms}, release={self.release_timeout_ms}"
         )
 
+        # --- Dedicated control loop (to isolate from bulk PUT loop contention) ---
+        self.loop = loop  # keep original loop for bulk tasks (PUT & GET read/reconstruct)
+        self.loop_control = asyncio.new_event_loop()
+        self._control_thread = threading.Thread(
+            target=self._run_loop, args=(self.loop_control,),
+            name="kv-service-sm-control", daemon=True
+        )
+        self._control_thread.start()
+
+        # Optional warmups to trim first-hit latency (safe to ignore failures)
+        try:
+            # Create sessions early
+            asyncio.run_coroutine_threadsafe(
+                self._ensure_http_session(control=True), self.loop_control
+            ).result(timeout=2.0)
+            asyncio.run_coroutine_threadsafe(
+                self._ensure_http_session(control=False), self.loop
+            ).result(timeout=2.0)
+        except Exception:
+            pass
+
     def __str__(self):
         return self.__class__.__name__
 
@@ -156,19 +197,39 @@ class KVServiceSMBackend(StorageBackendInterface):
                 key.request_configs,
             )
 
-            # DEBUG: Log the cache key lookup details
-            key_str = self._key_to_string(lookup_key)
+            # Fast path A: locally leased already (lock-free read)
             if lookup_key in self.leases:
-                logger.debug(f"Key found in local leases - CACHE HIT")
                 return True
 
-            lease_info = asyncio.run_coroutine_threadsafe(
-                self._acquire_lease(lookup_key), self.loop
-            ).result()
+            # Fast path B: short-lived positive/negative caches
+            key_str = self._key_str_cached(lookup_key)
+            now_ms = self._now_ms()
+            ts = self._pos.get(key_str)
+            if ts is not None and ts > now_ms:
+                return True
+            ts = self._neg.get(key_str)
+            if ts is not None and ts > now_ms:
+                return False
 
-            result = lease_info is not None
-            logger.debug(f"Lease acquisition result: {'SUCCESS' if result else 'FAILED'}")
-            return result
+            # Single-flight: ensure only one lease POST per key
+            fut = self._singleflight_acquire(lookup_key, key_str)
+
+            # Hard cap waiting time for contains equal to lease_timeout_ms (default lowered externally)
+            wait_s = max(0.001, self.lease_timeout_ms / 1000.0)
+            lease_info = None
+            try:
+                lease_info = fut.result(timeout=wait_s)
+            except Exception:
+                lease_info = None
+
+            if lease_info:
+                with self._pos_lock:
+                    self._pos[key_str] = self._now_ms() + self._pos_ttl_ms
+                return True
+            else:
+                with self._neg_lock:
+                    self._neg[key_str] = self._now_ms() + self._neg_ttl_ms
+                return False
         except Exception as e:
             logger.error(f"Exception during key existence check: {e}")
             return False
@@ -205,66 +266,72 @@ class KVServiceSMBackend(StorageBackendInterface):
         )
         return None
 
-    async def _ensure_http_session(self) -> aiohttp.ClientSession:
-        """Ensure HTTP session with connection pooling is initialized."""
-        if self.http_session is None:
-            async with self.session_lock:
-                if self.http_session is None:  # Double-check locking
-                    connector = aiohttp.TCPConnector(
-                        limit=self.max_connections,  # Total connection pool size
-                        limit_per_host=self.max_connections_per_host,  # Per-host connection limit  # noqa: E501
-                        ttl_dns_cache=300,  # DNS cache TTL (5 min)
-                        use_dns_cache=True,  # Enable DNS caching
-                        keepalive_timeout=30,  # Keep connections alive
-                        enable_cleanup_closed=True,  # Clean up closed connections
-                    )
+    async def _ensure_http_session(self, control: bool) -> aiohttp.ClientSession:
+        """Ensure HTTP session; separate pools for control vs bulk traffic."""
+        attr = "http_session_control" if control else "http_session_bulk"
+        sess = getattr(self, attr)
+        if sess is not None:
+            return sess
+        with self.session_lock:
+            sess = getattr(self, attr)
+            if sess is not None:
+                return sess
+            # Control plane: prefer latency; generous conn limits to avoid HOL
+            if control:
+                limit = max(self.max_connections, 512)
+                limit_per_host = max(self.max_connections_per_host, 512)
+                timeout = aiohttp.ClientTimeout(total=10, connect=2, sock_read=5)
+            else:
+                limit = max(64, self.max_connections // 2)
+                limit_per_host = max(32, self.max_connections_per_host // 2)
+                timeout = aiohttp.ClientTimeout(total=30, connect=5, sock_read=10)
 
-                    timeout = aiohttp.ClientTimeout(
-                        total=30,  # Total timeout for request
-                        connect=5,  # Connection timeout
-                        sock_read=10,  # Socket read timeout
-                    )
-
-                    self.http_session = aiohttp.ClientSession(
-                        connector=connector,
-                        timeout=timeout,
-                        headers={"User-Agent": "LMCache-KVServiceSMBackend/1.0"},
-                    )
-                    logger.info(
-                        f"Created HTTP session with {self.max_connections} max connections"  # noqa: E501
-                    )
-
-        return self.http_session
+            connector = aiohttp.TCPConnector(
+                limit=limit,
+                limit_per_host=limit_per_host,
+                ttl_dns_cache=300,
+                use_dns_cache=True,
+                keepalive_timeout=60,
+                enable_cleanup_closed=True,
+            )
+            sess = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                headers={"User-Agent": "LMCache-KVServiceSMBackend/1.0"},
+            )
+            setattr(self, attr, sess)
+            logger.info(
+                f"Created HTTP session ({'control' if control else 'bulk'}) "
+                f"limit={limit} per_host={limit_per_host}"
+            )
+            return sess
 
     async def _http_request(
-        self, method: str, url: str, data=None, params=None, timeout=5.0
+        self, method: str, url: str, data=None, params=None, timeout=5.0, *, control=False
     ):
-        """Optimized HTTP request with connection pooling."""
+        """Optimized HTTP request with connection pooling; minimal parsing."""
         try:
-            session = await self._ensure_http_session()
+            session = await self._ensure_http_session(control=control)
             request_timeout = aiohttp.ClientTimeout(total=timeout)
 
             async with session.request(
                 method, url, data=data, params=params, timeout=request_timeout
             ) as response:
-                result = {
-                    "status": response.status,
-                    "data": await response.read()
-                    if method in ["PUT", "POST"]
-                    else None,
-                    "json": await response.json()
+                # Avoid heavy reads on control path; only parse JSON when advertised
+                payload_json = (
+                    await response.json()
                     if response.content_type == "application/json"
-                    else None,
-                }
-                return result
+                    else None
+                )
+                return {"status": response.status, "json": payload_json}
         except asyncio.TimeoutError:
-            logger.warning(f"HTTP {method} request timeout for {url} (timeout: {timeout}s)")
+            logger.warning(f"HTTP {method} timeout for {url} ({timeout}s)")
             return None
         except aiohttp.ClientError as e:
             logger.error(f"HTTP {method} client error for {url}: {e}")
             return None
         except Exception as e:
-            logger.error(f"HTTP {method} request failed for {url}: {e}")
+            logger.error(f"HTTP {method} failed for {url}: {e}")
             return None
 
     @_lmcache_nvtx_annotate
@@ -303,7 +370,7 @@ class KVServiceSMBackend(StorageBackendInterface):
             # HTTP request on event loop (I/O-bound operation)
             http_start = loop.time()
             result = await self._http_request(
-                "PUT", url, data=data, timeout=self.put_timeout_ms / 1000.0
+                "PUT", url, data=data, timeout=self.put_timeout_ms / 1000.0, control=False
             )
             http_time = loop.time() - http_start
 
@@ -367,7 +434,12 @@ class KVServiceSMBackend(StorageBackendInterface):
                 lease_info = self.leases.get(lookup_key)
 
         if lease_info is None:
-            lease_info = await self._acquire_lease(lookup_key)
+            key_str = self._key_str_cached(lookup_key)
+            fut = self._singleflight_acquire(lookup_key, key_str)
+            try:
+                lease_info = await asyncio.wrap_future(fut)
+            except Exception:
+                lease_info = None
 
         if lease_info is None:
             return None
@@ -378,18 +450,25 @@ class KVServiceSMBackend(StorageBackendInterface):
             return result
         finally:
             # Step 3: Always release lease
-            await self._release_lease(lease_info.lease_id)
+            release_future = asyncio.run_coroutine_threadsafe(
+                self._release_lease(lease_info.lease_id), self.loop_control
+            )
+            try:
+                await asyncio.wrap_future(release_future)
+            except Exception:
+                pass
 
     async def _acquire_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
         """Acquire a lease for the given key from KVServiceSM daemon."""
-        key_str = self._key_to_string(key)
+        key_str = self._key_str_cached(key)
         url = f"{self.base_url}/v1/kv/{self.bucket_name}/{key_str}/leases"
         params = {"timeout_ms": self.lease_timeout_ms}
-        
-        logger.debug(f"Acquiring lease for key {key_str} with timeout {self.lease_timeout_ms}ms")
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Acquiring lease for key %s (timeout %d ms)", key_str, self.lease_timeout_ms)
 
         result = await self._http_request(
-            "POST", url, params=params, timeout=self.lease_timeout_ms / 1000.0
+            "POST", url, params=params, timeout=self.lease_timeout_ms / 1000.0, control=True
         )
 
         if result and result["status"] == 200 and result["json"]:
@@ -404,15 +483,17 @@ class KVServiceSMBackend(StorageBackendInterface):
                 self.leases[key] = lease_info
                 self.lease_id_to_key[lease_info.lease_id] = key
 
-            logger.debug(f"Lease acquired successfully: {lease_info.lease_id}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Lease acquired: %s", lease_info.lease_id)
             return lease_info
-        
-        logger.debug(f"Failed to acquire lease for {key_str} - timeout after {self.lease_timeout_ms}ms")
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Failed to acquire lease for %s (timeout %d ms)", key_str, self.lease_timeout_ms)
         return None
 
     async def _release_lease(self, lease_id: str) -> bool:
         url = f"{self.base_url}/v1/leases/{lease_id}/release"
-        result = await self._http_request("POST", url, timeout=self.release_timeout_ms / 1000.0)
+        result = await self._http_request("POST", url, timeout=self.release_timeout_ms / 1000.0, control=True)
 
         # Consider both 200 OK and 404 Not Found as "success" since in both cases
         # the lease is no longer active on the server
@@ -616,24 +697,38 @@ class KVServiceSMBackend(StorageBackendInterface):
         try:
             for lease_id in lease_ids_to_release:
                 asyncio.run_coroutine_threadsafe(
-                    self._release_lease(lease_id), self.loop
+                    self._release_lease(lease_id), self.loop_control
                 ).result(timeout=2.0)
 
             logger.info(f"Released {len(lease_ids_to_release)} key leases")
         except Exception as e:
             logger.error(f"Error releasing key leases: {e}")
 
-        # Close HTTP session and connection pool
-        if self.http_session is not None:
+        # Close HTTP sessions (both)
+        async def _close_session(sess):
             try:
-                # Schedule closure on the event loop
-                asyncio.run_coroutine_threadsafe(
-                    self.http_session.close(), self.loop
-                ).result(timeout=5.0)
-                logger.info("HTTP session closed")
+                if sess is not None:
+                    await sess.close()
             except Exception as e:
-                logger.error(f"Error closing HTTP session: {e}")
-            self.http_session = None
+                logger.error("Error closing HTTP session: %s", e)
+
+        try:
+            if self.http_session_control is not None:
+                asyncio.run_coroutine_threadsafe(
+                    _close_session(self.http_session_control), self.loop_control
+                ).result(timeout=5.0)
+        except Exception as e:
+            logger.error("Error closing control HTTP session: %s", e)
+        self.http_session_control = None
+
+        try:
+            if self.http_session_bulk is not None:
+                asyncio.run_coroutine_threadsafe(
+                    _close_session(self.http_session_bulk), self.loop
+                ).result(timeout=5.0)
+        except Exception as e:
+            logger.error("Error closing bulk HTTP session: %s", e)
+        self.http_session_bulk = None
 
         # Shutdown thread pool
         if self.thread_pool is not None:
@@ -661,23 +756,55 @@ class KVServiceSMBackend(StorageBackendInterface):
                     logger.error(f"Error closing shared memory: {e}")
                 self.shared_memory_obj = None
 
+        # Stop control loop
+        try:
+            if self.loop_control.is_running():
+                self.loop_control.call_soon_threadsafe(self.loop_control.stop)
+            if self._control_thread.is_alive():
+                self._control_thread.join(timeout=2.0)
+            self.loop_control.close()
+        except Exception as e:
+            logger.error("Error stopping control loop: %s", e)
+
         logger.info("KVServiceSMBackend closed with all resources cleaned up.")
 
     # Helper methods
+    def _run_loop(self, loop: asyncio.AbstractEventLoop):
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
 
     def _key_to_string(self, key: CacheEngineKey) -> str:
-        """Convert CacheEngineKey to string format for HTTP API.
-
-        Use URL encoding for complete safety instead of character replacement.
-        This avoids conflicts with existing underscores in keys.
-        """
-        # Standard
+        """(Retained) Convert CacheEngineKey to URL-encoded string."""
         import urllib.parse
+        return urllib.parse.quote(key.to_string(), safe="")
 
-        key_str = key.to_string()
-        encoded_key = urllib.parse.quote(key_str, safe="")
-        
-        return encoded_key
+    def _key_str_cached(self, key: CacheEngineKey) -> str:
+        s = self._keystr_cache.get(key)
+        if s is not None:
+            return s
+        enc = self._key_to_string(key)
+        with self._keystr_lock:
+            # Another thread might have set it—no harm overwriting with same string
+            self._keystr_cache[key] = enc
+        return enc
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
+    def _singleflight_acquire(self, key: CacheEngineKey, key_str: str) -> Future:
+        with self._inflight_lock:
+            fut = self._inflight.get(key_str)
+            if fut is not None:
+                return fut
+            fut = asyncio.run_coroutine_threadsafe(self._acquire_lease(key), self.loop_control)
+            self._inflight[key_str] = fut
+
+            def _cleanup(_):
+                with self._inflight_lock:
+                    self._inflight.pop(key_str, None)
+            fut.add_done_callback(_cleanup)
+            return fut
 
     def _memory_obj_to_bytes(self, memory_obj: MemoryObj) -> bytes:
         """Ultra-simple serialization using Redis-style approach.
