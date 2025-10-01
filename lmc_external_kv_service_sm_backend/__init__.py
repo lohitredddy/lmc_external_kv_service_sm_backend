@@ -1,6 +1,38 @@
-"""LMCache External KVServiceSM Backend Package"""
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2024-2025 LMCache Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+KVServiceSM Backend for LMCache.
+
+A high-performance storage backend that integrates with KVServiceSM daemon
+for distributed KV cache storage with zero-copy shared memory access.
+"""
 
 from .kv_service_sm_backend import KVServiceSMBackend
+from .kv_service_sm_config import KVServiceSMConfig
+from .cache import KeyCache, LeaseInfo, CacheEntry
+from .utils import OperationPriority, OperationMetrics, LeaseManager
 
-__all__ = ['KVServiceSMBackend']
-__version__ = '0.1.0'
+__version__ = "0.1.0"
+__all__ = [
+    "KVServiceSMBackend",
+    "KVServiceSMConfig",
+    "KeyCache",
+    "LeaseInfo",
+    "CacheEntry",
+    "OperationPriority",
+    "OperationMetrics",
+    "LeaseManager",
+]
