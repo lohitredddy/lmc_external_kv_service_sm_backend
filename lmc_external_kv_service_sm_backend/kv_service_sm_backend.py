@@ -276,15 +276,28 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         i = 0
         while i < len(keys):
             batch = keys[i : i + window]
-            results = await asyncio.gather(
-                *(self._acquire_lease(k) for k in batch), return_exceptions=True
-            )
-            for k, r in zip(batch, results, strict=False):
-                lease = None if isinstance(r, Exception) else r
+            leases: list[Optional[LeaseInfo]] = [None] * len(batch)
+            missing_indices: list[int] = []
+            missing_tasks = []
+
+            for idx, key in enumerate(batch):
+                cached = await self._cache_peek_lease(key)
+                if cached is not None:
+                    leases[idx] = cached
+                    continue
+                missing_indices.append(idx)
+                missing_tasks.append(asyncio.create_task(self._acquire_lease(key)))
+
+            if missing_tasks:
+                results = await asyncio.gather(*missing_tasks, return_exceptions=True)
+                for idx, result in zip(missing_indices, results, strict=False):
+                    leases[idx] = None if isinstance(result, Exception) else result
+
+            for key, lease in zip(batch, leases, strict=False):
                 if lease is None:
                     return total
                 # Cache lease for a short time; get() will reuse and release it
-                await self._cache_put_lease(k, lease)
+                await self._cache_put_lease(key, lease)
                 total += 1
             i += window
         return total
@@ -307,6 +320,11 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
     # ------------------------------------------------------------------
 
     async def _contains_async(self, key: CacheEngineKey) -> bool:
+        # Fast path: if a valid cached lease exists, treat as contained.
+        lease = await self._cache_peek_lease(key)
+        if lease is not None:
+            return True
+
         lease = await self._acquire_lease(key)
         if lease is None:
             return False
@@ -318,6 +336,12 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         key_str = key.to_string()
         acquired = False
         try:
+            # Fast path: if we already have a valid cached lease for this key,
+            # we know it exists. Skip the PUT without any HTTP call.
+            cached = await self._cache_peek_lease(key)
+            if cached is not None:
+                return
+
             await self._put_sema.acquire()
             acquired = True
 
@@ -372,6 +396,28 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             asyncio.create_task(self._release_lease(lease.lease_id))
             return None
         return lease
+
+    async def _cache_peek_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
+        """Return a cached lease without consuming it, if still valid.
+
+        If the cached lease is expired, remove it and schedule a release.
+        """
+        key_str = key.to_string()
+        stale_lease_id: Optional[str] = None
+        async with self._lease_cache_lock:
+            entry = self._lease_cache.get(key_str)
+            if entry is None:
+                return None
+            lease, expiry = entry
+            if time.time() > expiry:
+                self._lease_cache.pop(key_str, None)
+                stale_lease_id = lease.lease_id
+            else:
+                return lease
+
+        if stale_lease_id is not None:
+            asyncio.create_task(self._release_lease(stale_lease_id))
+        return None
 
     async def _expire_lease_later(self, key_str: str, lease_id: str, expiry: float) -> None:
         try:
@@ -573,21 +619,29 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
         # RemoteMetadata header is 7 int32 = 28 bytes
         metadata_size = 4 * 7
-        buffer = bytearray()
-        for offset, length in lease_info.offsets:
-            chunk = self._shared_memory_map[offset : offset + length]
-            buffer.extend(chunk)
 
-        if len(buffer) < metadata_size:
-            logger.error(f"Lease payload too small for metadata for key {key}")
+        # 1) Read only the header across offsets
+        header = bytearray(metadata_size)
+        filled = 0
+        for off, ln in lease_info.offsets:
+            if filled >= metadata_size:
+                break
+            take = min(ln, metadata_size - filled)
+            header[filled : filled + take] = self._shared_memory_map[off : off + take]
+            filled += take
+
+        if filled < metadata_size:
+            logger.error("Lease payload too small for metadata for key %s", key)
             return None
 
-        metadata = RemoteMetadata.deserialize(buffer[:metadata_size])
-        payload = buffer[metadata_size : metadata_size + metadata.length]
-        if len(payload) != metadata.length:
-            logger.error("Payload size mismatch while reading key %s", key)
+        # 2) Parse metadata
+        metadata = RemoteMetadata.deserialize(header)
+        payload_len = metadata.length
+        if payload_len <= 0:
+            logger.error("Invalid payload length %d for key %s", payload_len, key)
             return None
 
+        # 3) Allocate destination
         memory_obj = self.memory_allocator.allocate(
             metadata.shape,
             metadata.dtype,
@@ -597,10 +651,38 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             logger.error("Failed to allocate memory for key %s", key)
             return None
 
-        view = memory_obj.byte_array if isinstance(memory_obj.byte_array, memoryview) else memoryview(memory_obj.byte_array)
+        view = (
+            memory_obj.byte_array
+            if isinstance(memory_obj.byte_array, memoryview)
+            else memoryview(memory_obj.byte_array)
+        )
         if getattr(view, "format", None) == "<B":
             view = view.cast("B")
-        view[: metadata.length] = payload
+
+        # 4) Direct copy from SHM to destination, skipping header bytes
+        copied = 0
+        bytes_to_skip = metadata_size
+        for off, ln in lease_info.offsets:
+            if copied >= payload_len:
+                break
+            # Skip header bytes first
+            if bytes_to_skip > 0:
+                if ln <= bytes_to_skip:
+                    bytes_to_skip -= ln
+                    continue
+                off += bytes_to_skip
+                ln -= bytes_to_skip
+                bytes_to_skip = 0
+            if ln <= 0:
+                continue
+            take = min(payload_len - copied, ln)
+            view[copied : copied + take] = self._shared_memory_map[off : off + take]
+            copied += take
+
+        if copied != payload_len:
+            logger.error("Data size mismatch: expected %d, got %d", payload_len, copied)
+            return None
+
         return memory_obj
 
     def _memory_obj_to_bytes(self, memory_obj: MemoryObj) -> bytes:
