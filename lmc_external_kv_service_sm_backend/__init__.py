@@ -20,19 +20,12 @@ A high-performance storage backend that integrates with KVServiceSM daemon
 for distributed KV cache storage with zero-copy shared memory access.
 """
 
-from .kv_service_sm_backend import KVServiceSMBackend
+from .kv_service_sm_backend import KVServiceSMBackend, LeaseInfo
 from .kv_service_sm_config import KVServiceSMConfig
-from .cache import KeyCache, LeaseInfo, CacheEntry
-from .utils import OperationPriority, OperationMetrics, LeaseManager
 
 __version__ = "0.1.0"
 __all__ = [
     "KVServiceSMBackend",
     "KVServiceSMConfig",
-    "KeyCache",
     "LeaseInfo",
-    "CacheEntry",
-    "OperationPriority",
-    "OperationMetrics",
-    "LeaseManager",
 ]
