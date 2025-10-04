@@ -18,6 +18,7 @@ from __future__ import annotations
 # Standard
 from concurrent.futures import Future
 from dataclasses import dataclass
+from enum import IntEnum, auto
 from multiprocessing import shared_memory
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
@@ -37,6 +38,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.abstract_backend import ConfigurableStorageBackendInterface
+from lmcache.v1.storage_backend.job_executor.pq_executor import AsyncPQExecutor
 
 from .kv_service_sm_config import KVServiceSMConfig
 
@@ -53,6 +55,14 @@ class LeaseInfo:
     lease_id: str
     offsets: List[Tuple[int, int]]
     total_size: int
+
+
+class _KVSMTaskPriority(IntEnum):
+    """Priority buckets for control-plane scheduling."""
+
+    LEASE = 0
+    PREFETCH = auto()
+    PUT = auto()
 
 
 class KVServiceSMBackend(ConfigurableStorageBackendInterface):
@@ -100,17 +110,26 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         self._shared_memory_lock = threading.Lock()
 
         # PUT concurrency & tracking
-        self._put_sema = asyncio.Semaphore(max(1, self.kv_config.max_concurrent_puts))
         self._put_lock = threading.Lock()
         self._put_futures: Dict[str, Future] = {}
+
+        # Prioritized executors keep control-plane responsive even under PUT load.
+        self._control_executor = AsyncPQExecutor(
+            loop,
+            max_workers=max(1, self.kv_config.control_max_connections_per_host),
+        )
+        self._put_executor = AsyncPQExecutor(
+            loop,
+            max_workers=max(1, self.kv_config.put_max_connections_per_host),
+        )
 
         self._closed = False
 
         # Short-lived lease cache so contains() can be followed by get() without
-        # re-acquiring the lease. TTL 5 seconds by default.
+        # re-acquiring the lease. TTL tracks the server lease TTL.
         self._lease_cache: Dict[str, tuple[LeaseInfo, float]] = {}
         self._lease_cache_lock = asyncio.Lock()
-        self._lease_cache_ttl_ms = 5000
+        self._lease_cache_ttl_s = float(self.kv_config.lease_ttl_s)
 
     # ------------------------------------------------------------------
     # Public API expected by the base interface
@@ -165,7 +184,13 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
             memory_obj.ref_count_up()
             future = asyncio.run_coroutine_threadsafe(
-                self._put_once(key, memory_obj), self.loop
+                self._put_executor.submit_job(
+                    self._put_once,
+                    key,
+                    memory_obj,
+                    priority=_KVSMTaskPriority.PUT,
+                ),
+                self.loop,
             )
             self._put_futures[key_str] = future
             return future
@@ -210,6 +235,9 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         try:
             with self._put_lock:
                 self._put_futures.clear()
+
+            self._control_executor.shutdown(wait=True)
+            self._put_executor.shutdown(wait=True)
 
             # Close HTTP sessions
             if self._control_session is not None:
@@ -271,7 +299,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
         # Process in concurrent windows to reduce total latency when many
         # leading keys exist. Early stop at first miss.
-        window = max(1, min(32, self.kv_config.control_max_connections_per_host))
+        window = max(1, self.kv_config.control_max_connections_per_host)
         total = 0
         i = 0
         while i < len(keys):
@@ -286,7 +314,15 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                     leases[idx] = cached
                     continue
                 missing_indices.append(idx)
-                missing_tasks.append(asyncio.create_task(self._acquire_lease(key)))
+                task = asyncio.create_task(
+                    self._control_executor.submit_job(
+                        self._acquire_lease,
+                        key,
+                        priority=_KVSMTaskPriority.LEASE,
+                    )
+                )
+                task.add_done_callback(lambda fut: fut.exception())
+                missing_tasks.append(task)
 
             if missing_tasks:
                 results = await asyncio.gather(*missing_tasks, return_exceptions=True)
@@ -325,7 +361,11 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         if lease is not None:
             return True
 
-        lease = await self._acquire_lease(key)
+        lease = await self._control_executor.submit_job(
+            self._acquire_lease,
+            key,
+            priority=_KVSMTaskPriority.LEASE,
+        )
         if lease is None:
             return False
         # Cache lease; do not release now. A following get() will consume it.
@@ -334,16 +374,12 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
     async def _put_once(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         key_str = key.to_string()
-        acquired = False
         try:
             # Fast path: if we already have a valid cached lease for this key,
             # we know it exists. Skip the PUT without any HTTP call.
             cached = await self._cache_peek_lease(key)
             if cached is not None:
                 return
-
-            await self._put_sema.acquire()
-            acquired = True
 
             payload = await asyncio.to_thread(self._memory_obj_to_bytes, memory_obj)
             url = self._build_kv_url(key)
@@ -359,8 +395,6 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         except Exception as exc:  # pragma: no cover - log and continue
             logger.error(f"PUT exception for key {key}: {exc}")
         finally:
-            if acquired:
-                self._put_sema.release()
             memory_obj.ref_count_down()
             with self._put_lock:
                 self._put_futures.pop(key_str, None)
@@ -368,79 +402,52 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
     async def _get_memory_obj(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         lease = await self._cache_take_lease(key)
         if lease is None:
-            lease = await self._acquire_lease(key)
+            lease = await self._control_executor.submit_job(
+                self._acquire_lease,
+                key,
+                priority=_KVSMTaskPriority.LEASE,
+            )
         if lease is None:
             return None
-        try:
-            return await self._read_from_shared_memory(key, lease)
-        finally:
-            await self._release_lease(lease.lease_id)
+        return await self._read_from_shared_memory(key, lease)
 
     async def _cache_put_lease(self, key: CacheEngineKey, lease: LeaseInfo) -> None:
         key_str = key.to_string()
-        expiry = time.time() + (self._lease_cache_ttl_ms / 1000.0)
+        cached_at = time.time()
         async with self._lease_cache_lock:
-            self._lease_cache[key_str] = (lease, expiry)
-        # Schedule expiry; if not consumed by then, release it.
-        asyncio.create_task(self._expire_lease_later(key_str, lease.lease_id, expiry))
+            self._lease_cache[key_str] = (lease, cached_at)
 
     async def _cache_take_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
         key_str = key.to_string()
         async with self._lease_cache_lock:
-            entry = self._lease_cache.pop(key_str, None)
-        if entry is None:
-            return None
-        lease, expiry = entry
-        if time.time() > expiry:
-            # Already expired; make sure it is released asynchronously
-            asyncio.create_task(self._release_lease(lease.lease_id))
-            return None
-        return lease
+            entry = self._lease_cache.get(key_str)
+            if entry is None:
+                return None
+            lease, cached_at = entry
+            if time.time() - cached_at > self._lease_cache_ttl_s:
+                self._lease_cache.pop(key_str, None)
+                return None
+            return lease
 
     async def _cache_peek_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
-        """Return a cached lease without consuming it, if still valid.
-
-        If the cached lease is expired, remove it and schedule a release.
-        """
+        """Return a cached lease without consuming it when still within the TTL."""
         key_str = key.to_string()
-        stale_lease_id: Optional[str] = None
         async with self._lease_cache_lock:
             entry = self._lease_cache.get(key_str)
             if entry is None:
                 return None
-            lease, expiry = entry
-            if time.time() > expiry:
+            lease, cached_at = entry
+            if time.time() - cached_at > self._lease_cache_ttl_s:
                 self._lease_cache.pop(key_str, None)
-                stale_lease_id = lease.lease_id
-            else:
-                return lease
-
-        if stale_lease_id is not None:
-            asyncio.create_task(self._release_lease(stale_lease_id))
-        return None
-
-    async def _expire_lease_later(self, key_str: str, lease_id: str, expiry: float) -> None:
-        try:
-            delay = max(0.0, expiry - time.time())
-            if delay > 0:
-                await asyncio.sleep(delay)
-            async with self._lease_cache_lock:
-                # If still cached and expired, pop and release
-                entry = self._lease_cache.get(key_str)
-                if entry is None:
-                    return
-                cached_lease, cached_expiry = entry
-                if time.time() >= cached_expiry:
-                    self._lease_cache.pop(key_str, None)
-                else:
-                    return
-        finally:
-            # Release regardless; server treats duplicate/late releases as harmless
-            await self._release_lease(lease_id)
+                return None
+            return lease
 
     async def _acquire_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
         url = f"{self.kv_config.base_url}/v1/kv/{self.kv_config.bucket_name}/{self._key_to_string(key)}/leases"
-        params = {"timeout_ms": self.kv_config.lease_timeout_ms}
+        params = {
+            "timeout_ms": self.kv_config.lease_timeout_ms,
+            "ttl_s": self.kv_config.lease_ttl_s,
+        }
         response = await self._control_http_request(
             "POST",
             url,
@@ -459,14 +466,6 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             total_size=sum(length for _, length in offsets),
         )
 
-    async def _release_lease(self, lease_id: str) -> bool:
-        url = f"{self.kv_config.base_url}/v1/leases/{lease_id}/release"
-        response = await self._control_http_request(
-            "POST",
-            url,
-            timeout=self.kv_config.release_timeout_ms / 1000.0,
-        )
-        return bool(response) and response.get("status") in (200, 404)
     async def _ensure_control_session(self) -> aiohttp.ClientSession:
         if self._control_session and not self._control_session.closed:
             return self._control_session
@@ -570,13 +569,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                         body_json = await response.json()
                     except Exception:
                         body_json = None
-                body_data = None
-                if method in {"PUT", "POST"}:
-                    try:
-                        body_data = await response.read()
-                    except Exception:
-                        body_data = None
-                return {"status": response.status, "json": body_json, "data": body_data}
+                return {"status": response.status, "json": body_json}
         except asyncio.TimeoutError:
             logger.warning(f"HTTP {method} timeout talking to {url}")
             return None

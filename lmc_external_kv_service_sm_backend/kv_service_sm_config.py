@@ -31,18 +31,20 @@ class KVServiceSMConfig:
     connection_keepalive: int = 30
     dns_ttl: int = 300
 
-    control_max_connections: int = 128
-    control_max_connections_per_host: int = 128
-    put_max_connections: int = 48
-    put_max_connections_per_host: int = 48
+    control_max_connections: int = 256
+    control_max_connections_per_host: int = 256
+    put_max_connections: int = 256
+    put_max_connections_per_host: int = 256
     max_concurrent_puts: int = 32
     
     # Timeout settings (milliseconds)
     lease_timeout_ms: int = 500
     put_timeout_ms: int = 5000
-    release_timeout_ms: int = 2000
     http_connect_timeout_ms: int = 5000
     http_read_timeout_ms: int = 10000
+
+    # Lease expiration (seconds)
+    lease_ttl_s: int = 30
     
     @classmethod
     def from_extra_config(cls, extra_config: Optional[dict]) -> "KVServiceSMConfig":
@@ -67,7 +69,7 @@ class KVServiceSMConfig:
             # Timeouts
             lease_timeout_ms=extra_config.get("kv_service_sm_lease_timeout_ms", cls.lease_timeout_ms),
             put_timeout_ms=extra_config.get("kv_service_sm_put_timeout_ms", cls.put_timeout_ms),
-            release_timeout_ms=extra_config.get("kv_service_sm_release_timeout_ms", cls.release_timeout_ms),
             http_connect_timeout_ms=extra_config.get("kv_service_sm_http_connect_timeout_ms", cls.http_connect_timeout_ms),
             http_read_timeout_ms=extra_config.get("kv_service_sm_http_read_timeout_ms", cls.http_read_timeout_ms),
+            lease_ttl_s=extra_config.get("kv_service_sm_lease_ttl_s", cls.lease_ttl_s),
         )
