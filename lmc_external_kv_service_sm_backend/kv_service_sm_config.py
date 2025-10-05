@@ -35,17 +35,21 @@ class KVServiceSMConfig:
     control_max_connections_per_host: int = 256
     put_max_connections: int = 256
     put_max_connections_per_host: int = 256
-    max_concurrent_puts: int = 32
-    
+
     # Timeout settings (milliseconds)
     lease_timeout_ms: int = 500
-    put_timeout_ms: int = 5000
+    put_timeout_ms: int = 20000
     http_connect_timeout_ms: int = 5000
     http_read_timeout_ms: int = 10000
 
     # Lease expiration (seconds)
     lease_ttl_s: int = 30
-    
+
+    # Cache configuration
+    lease_cache_max_size: int = 20000      # Max lease cache entries
+    put_cache_ttl_s: int = 10              # Recent PUT cache TTL (seconds)
+    put_cache_max_size: int = 20000        # Max PUT cache entries
+
     @classmethod
     def from_extra_config(cls, extra_config: Optional[dict]) -> "KVServiceSMConfig":
         """Create config from LMCache extra_config dictionary."""
@@ -64,7 +68,6 @@ class KVServiceSMConfig:
             control_max_connections_per_host=extra_config.get("kv_service_sm_control_max_connections_per_host", cls.control_max_connections_per_host),
             put_max_connections=extra_config.get("kv_service_sm_put_max_connections", cls.put_max_connections),
             put_max_connections_per_host=extra_config.get("kv_service_sm_put_max_connections_per_host", cls.put_max_connections_per_host),
-            max_concurrent_puts=extra_config.get("kv_service_sm_max_concurrent_puts", cls.max_concurrent_puts),
 
             # Timeouts
             lease_timeout_ms=extra_config.get("kv_service_sm_lease_timeout_ms", cls.lease_timeout_ms),
@@ -72,4 +75,9 @@ class KVServiceSMConfig:
             http_connect_timeout_ms=extra_config.get("kv_service_sm_http_connect_timeout_ms", cls.http_connect_timeout_ms),
             http_read_timeout_ms=extra_config.get("kv_service_sm_http_read_timeout_ms", cls.http_read_timeout_ms),
             lease_ttl_s=extra_config.get("kv_service_sm_lease_ttl_s", cls.lease_ttl_s),
+
+            # Cache config
+            lease_cache_max_size=extra_config.get("lease_cache_max_size", cls.lease_cache_max_size),
+            put_cache_ttl_s=extra_config.get("put_cache_ttl_s", cls.put_cache_ttl_s),
+            put_cache_max_size=extra_config.get("put_cache_max_size", cls.put_cache_max_size),
         )

@@ -128,8 +128,13 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         # Short-lived lease cache so contains() can be followed by get() without
         # re-acquiring the lease. TTL tracks the server lease TTL.
         self._lease_cache: Dict[str, tuple[LeaseInfo, float]] = {}
-        self._lease_cache_lock = asyncio.Lock()
         self._lease_cache_ttl_s = float(self.kv_config.lease_ttl_s)
+        self._lease_cache_max_size = self.kv_config.lease_cache_max_size
+
+        # Recent PUT cache (skip redundant serialization + 409s)
+        self._recent_puts: Dict[str, float] = {}
+        self._recent_put_ttl_s = float(self.kv_config.put_cache_ttl_s)
+        self._recent_put_max_size = self.kv_config.put_cache_max_size
 
     # ------------------------------------------------------------------
     # Public API expected by the base interface
@@ -143,10 +148,19 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             future = asyncio.run_coroutine_threadsafe(
                 self._contains_async(key), self.loop
             )
-            timeout_s = (self.kv_config.lease_timeout_ms + 200) / 1000.0
+            # Increase timeout to handle executor queue delays
+            # 2x lease timeout + 1s buffer
+            timeout_s = (self.kv_config.lease_timeout_ms * 2 + 1000) / 1000.0
             return future.result(timeout=timeout_s)
-        except Exception as exc:  # pragma: no cover - best effort logging
-            logger.error(f"contains() failed for key {key}: {exc}")
+
+        except TimeoutError:
+            # Expected under high load - debug level
+            logger.debug(f"contains() timeout for {key} (executor queue saturated)")
+            return False
+
+        except Exception as exc:
+            # Unexpected errors - warning level
+            logger.warning(f"contains() failed for {key}: {exc}")
             return False
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -235,6 +249,10 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         try:
             with self._put_lock:
                 self._put_futures.clear()
+
+            # Clear caches (no locks needed)
+            self._lease_cache = {}
+            self._recent_puts = {}
 
             self._control_executor.shutdown(wait=True)
             self._put_executor.shutdown(wait=True)
@@ -375,25 +393,48 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
     async def _put_once(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         key_str = key.to_string()
         try:
-            # Fast path: if we already have a valid cached lease for this key,
-            # we know it exists. Skip the PUT without any HTTP call.
-            cached = await self._cache_peek_lease(key)
-            if cached is not None:
+            # Fast path 1: Check lease cache (key exists on server)
+            cached_lease = await self._cache_peek_lease(key)
+            if cached_lease is not None:
+                logger.debug(f"Skipping PUT for {key}: lease cached (key exists)")
                 return
 
+            # Fast path 2: Check recent PUT cache (skip expensive serialization)
+            if await self._check_recent_put(key):
+                logger.debug(f"Skipping PUT for {key}: recently PUT")
+                return
+
+            # Slow path: Serialize payload (EXPENSIVE for large prompts!)
             payload = await asyncio.to_thread(self._memory_obj_to_bytes, memory_obj)
             url = self._build_kv_url(key)
+
+            # Send PUT request
             response = await self._data_http_request(
                 "PUT",
                 url,
                 data=payload,
                 timeout=self.kv_config.put_timeout_ms / 1000.0,
             )
-            if not response or response.get("status") != 200:
+
+            # Handle response
+            if response and response.get("status") == 200:
+                # Success - mark as recently PUT
+                await self._mark_recent_put(key)
+                logger.debug(f"PUT succeeded for {key}")
+
+            elif response and response.get("status") == 409:
+                # 409 Conflict = key already exists (NOT an error!)
+                # Mark as recently PUT to skip future redundant PUTs
+                await self._mark_recent_put(key)
+                logger.debug(f"PUT skipped for {key}: already exists (409)")
+
+            else:
+                # Real failure (timeout, 500, etc.)
                 status = None if response is None else response.get("status")
-                logger.error(f"PUT failed for key {key}: HTTP {status}")
+                logger.error(f"PUT failed for {key}: HTTP {status}")
+
         except Exception as exc:  # pragma: no cover - log and continue
-            logger.error(f"PUT exception for key {key}: {exc}")
+            logger.error(f"PUT exception for {key}: {exc}")
         finally:
             memory_obj.ref_count_down()
             with self._put_lock:
@@ -411,36 +452,146 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             return None
         return await self._read_from_shared_memory(key, lease)
 
+    # ------------------------------------------------------------------
+    # Common cache helper functions
+    # ------------------------------------------------------------------
+
+    def _cache_get_with_ttl(
+        self,
+        cache: Dict[str, tuple],
+        key_str: str,
+        ttl_s: float,
+    ) -> Optional[tuple]:
+        """Generic cache getter with strict TTL check and lazy cleanup.
+
+        Returns value if exists and not expired, None otherwise.
+        Atomically deletes expired entries.
+        """
+        entry = cache.get(key_str)
+        if entry is None:
+            return None
+
+        # For lease cache: entry is (lease, timestamp)
+        # For PUT cache: entry is timestamp
+        if isinstance(entry, tuple) and len(entry) == 2:
+            data, cached_at = entry
+            if time.time() - cached_at > ttl_s:
+                cache.pop(key_str, None)
+                return None
+            return entry
+        else:
+            # Simple timestamp value (PUT cache)
+            if time.time() - entry > ttl_s:
+                cache.pop(key_str, None)
+                return None
+            return entry
+
+    def _cache_put_with_eviction(
+        self,
+        cache: Dict[str, tuple],
+        key_str: str,
+        value: tuple,
+        max_size: int,
+    ) -> None:
+        """Generic cache setter with size-bounded eviction.
+
+        Inserts value and evicts oldest 10% if size exceeded.
+        """
+        cache[key_str] = value
+
+        # Size-bounded eviction
+        if len(cache) > max_size:
+            num_to_evict = max_size // 10  # Evict 10%
+
+            # Sort by timestamp
+            # For lease cache: value is (data, timestamp) - use x[1][1]
+            # For PUT cache: value is timestamp - use x[1]
+            if isinstance(value, tuple) and len(value) == 2:
+                # Lease cache
+                sorted_items = sorted(
+                    cache.items(),
+                    key=lambda x: x[1][1]  # x[1][1] is timestamp
+                )
+            else:
+                # PUT cache
+                sorted_items = sorted(
+                    cache.items(),
+                    key=lambda x: x[1]  # x[1] is timestamp
+                )
+
+            # Evict oldest
+            for old_key, _ in sorted_items[:num_to_evict]:
+                cache.pop(old_key, None)
+
+    # ------------------------------------------------------------------
+    # Lease cache methods
+    # ------------------------------------------------------------------
+
     async def _cache_put_lease(self, key: CacheEngineKey, lease: LeaseInfo) -> None:
+        """Cache lease with size-bounded eviction. Atomic, no lock."""
         key_str = key.to_string()
         cached_at = time.time()
-        async with self._lease_cache_lock:
-            self._lease_cache[key_str] = (lease, cached_at)
+
+        self._cache_put_with_eviction(
+            self._lease_cache,
+            key_str,
+            (lease, cached_at),
+            self._lease_cache_max_size,
+        )
 
     async def _cache_take_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
-        key_str = key.to_string()
-        async with self._lease_cache_lock:
-            entry = self._lease_cache.get(key_str)
-            if entry is None:
-                return None
-            lease, cached_at = entry
-            if time.time() - cached_at > self._lease_cache_ttl_s:
-                self._lease_cache.pop(key_str, None)
-                return None
-            return lease
+        """Take lease from cache ONLY if within TTL. Atomic, no lock."""
+        # In this implementation, we don't actually consume the lease
+        # (get() will reuse it from cache)
+        return await self._cache_peek_lease(key)
 
     async def _cache_peek_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
-        """Return a cached lease without consuming it when still within the TTL."""
+        """Return cached lease ONLY if within TTL. Atomic, no lock."""
         key_str = key.to_string()
-        async with self._lease_cache_lock:
-            entry = self._lease_cache.get(key_str)
-            if entry is None:
-                return None
-            lease, cached_at = entry
-            if time.time() - cached_at > self._lease_cache_ttl_s:
-                self._lease_cache.pop(key_str, None)
-                return None
-            return lease
+
+        entry = self._cache_get_with_ttl(
+            self._lease_cache,
+            key_str,
+            self._lease_cache_ttl_s,
+        )
+
+        if entry is None:
+            return None
+
+        # Entry is (lease, timestamp)
+        lease, _ = entry
+        return lease
+
+    # ------------------------------------------------------------------
+    # Recent PUT cache methods
+    # ------------------------------------------------------------------
+
+    async def _check_recent_put(self, key: CacheEngineKey) -> bool:
+        """Check if key was recently PUT. STRICT TTL enforcement. Atomic, no lock."""
+        key_str = key.to_string()
+
+        result = self._cache_get_with_ttl(
+            self._recent_puts,
+            key_str,
+            self._recent_put_ttl_s,
+        )
+
+        return result is not None
+
+    async def _mark_recent_put(self, key: CacheEngineKey) -> None:
+        """Mark key as recently PUT with size-bounded eviction. Atomic, no lock."""
+        key_str = key.to_string()
+
+        self._cache_put_with_eviction(
+            self._recent_puts,
+            key_str,
+            time.time(),
+            self._recent_put_max_size,
+        )
+
+    # ------------------------------------------------------------------
+    # Lease acquisition
+    # ------------------------------------------------------------------
 
     async def _acquire_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
         url = f"{self.kv_config.base_url}/v1/kv/{self.kv_config.bucket_name}/{self._key_to_string(key)}/leases"
