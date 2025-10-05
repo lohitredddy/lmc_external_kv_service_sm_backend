@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 # Standard
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from multiprocessing import shared_memory
@@ -101,10 +101,14 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         self.memory_allocator = local_cpu_backend.get_memory_allocator()
 
         # Shared resources
-        self._control_session: Optional[aiohttp.ClientSession] = None
-        self._control_session_lock = asyncio.Lock()
-        self._data_session: Optional[aiohttp.ClientSession] = None
-        self._data_session_lock = asyncio.Lock()
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._http_session_lock = asyncio.Lock()
+        self._control_inflight = asyncio.Semaphore(
+            max(1, self.kv_config.control_max_connections_per_host)
+        )
+        self._put_inflight = asyncio.Semaphore(
+            max(1, self.kv_config.put_max_connections_per_host)
+        )
         self._shared_memory_obj: Optional[shared_memory.SharedMemory] = None
         self._shared_memory_map: Optional[memoryview] = None
         self._shared_memory_lock = threading.Lock()
@@ -113,22 +117,30 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         self._put_lock = threading.Lock()
         self._put_futures: Dict[str, Future] = {}
 
-        # Prioritized executors keep control-plane responsive even under PUT load.
-        self._control_executor = AsyncPQExecutor(
-            loop,
-            max_workers=max(1, self.kv_config.control_max_connections_per_host),
+        # Single prioritized executor handles both control-plane and PUT tasks.
+        total_workers = max(
+            1,
+            self.kv_config.control_max_connections_per_host
+            + self.kv_config.put_max_connections_per_host,
         )
-        self._put_executor = AsyncPQExecutor(
+        self._executor = AsyncPQExecutor(
             loop,
-            max_workers=max(1, self.kv_config.put_max_connections_per_host),
+            max_workers=total_workers,
         )
 
         self._closed = False
 
         # Short-lived lease cache so contains() can be followed by get() without
-        # re-acquiring the lease. TTL tracks the server lease TTL.
+        # re-acquiring the lease. TTL tracks the server lease TTL by default.
         self._lease_cache: Dict[str, tuple[LeaseInfo, float]] = {}
         self._lease_cache_ttl_s = float(self.kv_config.lease_ttl_s)
+        # Optional override: bridge TTL for contains->get only
+        bridge_ms = extra_config.get("kv_service_sm_client_bridge_ttl_ms")
+        if bridge_ms is not None:
+            try:
+                self._lease_cache_ttl_s = max(0.0, float(bridge_ms) / 1000.0)
+            except Exception:
+                pass
         self._lease_cache_max_size = self.kv_config.lease_cache_max_size
 
         # Recent PUT cache (skip redundant serialization + 409s)
@@ -153,7 +165,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             timeout_s = (self.kv_config.lease_timeout_ms * 2 + 1000) / 1000.0
             return future.result(timeout=timeout_s)
 
-        except TimeoutError:
+        except FuturesTimeoutError:
             # Expected under high load - debug level
             logger.debug(f"contains() timeout for {key} (executor queue saturated)")
             return False
@@ -198,7 +210,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
             memory_obj.ref_count_up()
             future = asyncio.run_coroutine_threadsafe(
-                self._put_executor.submit_job(
+                self._executor.submit_job(
                     self._put_once,
                     key,
                     memory_obj,
@@ -254,27 +266,17 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             self._lease_cache = {}
             self._recent_puts = {}
 
-            self._control_executor.shutdown(wait=True)
-            self._put_executor.shutdown(wait=True)
+            self._executor.shutdown(wait=True)
 
-            # Close HTTP sessions
-            if self._control_session is not None:
+            # Close HTTP session
+            if self._http_session is not None:
                 try:
                     asyncio.run_coroutine_threadsafe(
-                        self._control_session.close(), self.loop
+                        self._http_session.close(), self.loop
                     ).result(timeout=5)
                 except Exception:
                     pass
-                self._control_session = None
-
-            if self._data_session is not None:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        self._data_session.close(), self.loop
-                    ).result(timeout=5)
-                except Exception:
-                    pass
-                self._data_session = None
+                self._http_session = None
 
             # Release shared memory handles
             with self._shared_memory_lock:
@@ -315,45 +317,23 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         if not keys:
             return 0
 
-        # Process in concurrent windows to reduce total latency when many
-        # leading keys exist. Early stop at first miss.
-        window = max(1, self.kv_config.control_max_connections_per_host)
         total = 0
-        i = 0
-        while i < len(keys):
-            batch = keys[i : i + window]
-            leases: list[Optional[LeaseInfo]] = [None] * len(batch)
-            missing_indices: list[int] = []
-            missing_tasks = []
-
-            for idx, key in enumerate(batch):
-                cached = await self._cache_peek_lease(key)
-                if cached is not None:
-                    leases[idx] = cached
-                    continue
-                missing_indices.append(idx)
-                task = asyncio.create_task(
-                    self._control_executor.submit_job(
+        for key in keys:
+            lease = self._cache_peek_lease(key)
+            if lease is None:
+                try:
+                    lease = await self._executor.submit_job(
                         self._acquire_lease,
                         key,
                         priority=_KVSMTaskPriority.LEASE,
                     )
-                )
-                task.add_done_callback(lambda fut: fut.exception())
-                missing_tasks.append(task)
-
-            if missing_tasks:
-                results = await asyncio.gather(*missing_tasks, return_exceptions=True)
-                for idx, result in zip(missing_indices, results, strict=False):
-                    leases[idx] = None if isinstance(result, Exception) else result
-
-            for key, lease in zip(batch, leases, strict=False):
-                if lease is None:
-                    return total
-                # Cache lease for a short time; get() will reuse and release it
-                await self._cache_put_lease(key, lease)
-                total += 1
-            i += window
+                except Exception as exc:
+                    logger.debug(f"Lease acquisition failed for {key}: {exc}")
+                    lease = None
+            if lease is None:
+                return total
+            self._cache_put_lease(key, lease)
+            total += 1
         return total
 
     async def batched_get_non_blocking(
@@ -375,11 +355,11 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
     async def _contains_async(self, key: CacheEngineKey) -> bool:
         # Fast path: if a valid cached lease exists, treat as contained.
-        lease = await self._cache_peek_lease(key)
+        lease = self._cache_peek_lease(key)
         if lease is not None:
             return True
 
-        lease = await self._control_executor.submit_job(
+        lease = await self._executor.submit_job(
             self._acquire_lease,
             key,
             priority=_KVSMTaskPriority.LEASE,
@@ -387,20 +367,20 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         if lease is None:
             return False
         # Cache lease; do not release now. A following get() will consume it.
-        await self._cache_put_lease(key, lease)
+        self._cache_put_lease(key, lease)
         return True
 
     async def _put_once(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         key_str = key.to_string()
         try:
             # Fast path 1: Check lease cache (key exists on server)
-            cached_lease = await self._cache_peek_lease(key)
+            cached_lease = self._cache_peek_lease(key)
             if cached_lease is not None:
                 logger.debug(f"Skipping PUT for {key}: lease cached (key exists)")
                 return
 
             # Fast path 2: Check recent PUT cache (skip expensive serialization)
-            if await self._check_recent_put(key):
+            if self._check_recent_put(key):
                 logger.debug(f"Skipping PUT for {key}: recently PUT")
                 return
 
@@ -408,24 +388,25 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             payload = await asyncio.to_thread(self._memory_obj_to_bytes, memory_obj)
             url = self._build_kv_url(key)
 
-            # Send PUT request
-            response = await self._data_http_request(
+            # Send PUT request (gate on network only)
+            response = await self._http_request(
                 "PUT",
                 url,
                 data=payload,
                 timeout=self.kv_config.put_timeout_ms / 1000.0,
+                gate=self._put_inflight,
             )
 
             # Handle response
             if response and response.get("status") == 200:
                 # Success - mark as recently PUT
-                await self._mark_recent_put(key)
+                self._mark_recent_put(key)
                 logger.debug(f"PUT succeeded for {key}")
 
             elif response and response.get("status") == 409:
                 # 409 Conflict = key already exists (NOT an error!)
                 # Mark as recently PUT to skip future redundant PUTs
-                await self._mark_recent_put(key)
+                self._mark_recent_put(key)
                 logger.debug(f"PUT skipped for {key}: already exists (409)")
 
             else:
@@ -441,16 +422,16 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 self._put_futures.pop(key_str, None)
 
     async def _get_memory_obj(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        lease = await self._cache_take_lease(key)
+        lease = self._cache_take_lease(key)
         if lease is None:
-            lease = await self._control_executor.submit_job(
+            lease = await self._executor.submit_job(
                 self._acquire_lease,
                 key,
                 priority=_KVSMTaskPriority.LEASE,
             )
         if lease is None:
             return None
-        return await self._read_from_shared_memory(key, lease)
+        return self._read_from_shared_memory(key, lease)
 
     # ------------------------------------------------------------------
     # Common cache helper functions
@@ -475,13 +456,13 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         # For PUT cache: entry is timestamp
         if isinstance(entry, tuple) and len(entry) == 2:
             data, cached_at = entry
-            if time.time() - cached_at > ttl_s:
+            if time.monotonic() - cached_at > ttl_s:
                 cache.pop(key_str, None)
                 return None
             return entry
         else:
             # Simple timestamp value (PUT cache)
-            if time.time() - entry > ttl_s:
+            if time.monotonic() - entry > ttl_s:
                 cache.pop(key_str, None)
                 return None
             return entry
@@ -527,10 +508,10 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
     # Lease cache methods
     # ------------------------------------------------------------------
 
-    async def _cache_put_lease(self, key: CacheEngineKey, lease: LeaseInfo) -> None:
+    def _cache_put_lease(self, key: CacheEngineKey, lease: LeaseInfo) -> None:
         """Cache lease with size-bounded eviction. Atomic, no lock."""
         key_str = key.to_string()
-        cached_at = time.time()
+        cached_at = time.monotonic()
 
         self._cache_put_with_eviction(
             self._lease_cache,
@@ -539,13 +520,22 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             self._lease_cache_max_size,
         )
 
-    async def _cache_take_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
-        """Take lease from cache ONLY if within TTL. Atomic, no lock."""
-        # In this implementation, we don't actually consume the lease
-        # (get() will reuse it from cache)
-        return await self._cache_peek_lease(key)
+    def _cache_take_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
+        """Consume a cached lease if within TTL. Atomic, no lock."""
+        key_str = key.to_string()
+        entry = self._cache_get_with_ttl(
+            self._lease_cache,
+            key_str,
+            self._lease_cache_ttl_s,
+        )
+        if entry is None:
+            return None
+        lease, _ = entry
+        # consume
+        self._lease_cache.pop(key_str, None)
+        return lease
 
-    async def _cache_peek_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
+    def _cache_peek_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
         """Return cached lease ONLY if within TTL. Atomic, no lock."""
         key_str = key.to_string()
 
@@ -566,7 +556,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
     # Recent PUT cache methods
     # ------------------------------------------------------------------
 
-    async def _check_recent_put(self, key: CacheEngineKey) -> bool:
+    def _check_recent_put(self, key: CacheEngineKey) -> bool:
         """Check if key was recently PUT. STRICT TTL enforcement. Atomic, no lock."""
         key_str = key.to_string()
 
@@ -578,14 +568,14 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
         return result is not None
 
-    async def _mark_recent_put(self, key: CacheEngineKey) -> None:
+    def _mark_recent_put(self, key: CacheEngineKey) -> None:
         """Mark key as recently PUT with size-bounded eviction. Atomic, no lock."""
         key_str = key.to_string()
 
         self._cache_put_with_eviction(
             self._recent_puts,
             key_str,
-            time.time(),
+            time.monotonic(),
             self._recent_put_max_size,
         )
 
@@ -599,11 +589,12 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             "timeout_ms": self.kv_config.lease_timeout_ms,
             "ttl_s": self.kv_config.lease_ttl_s,
         }
-        response = await self._control_http_request(
+        response = await self._http_request(
             "POST",
             url,
             params=params,
             timeout=self.kv_config.lease_timeout_ms / 1000.0,
+            gate=self._control_inflight,
         )
         if not response or response.get("status") != 200 or not response.get("json"):
             return None
@@ -617,15 +608,23 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             total_size=sum(length for _, length in offsets),
         )
 
-    async def _ensure_control_session(self) -> aiohttp.ClientSession:
-        if self._control_session and not self._control_session.closed:
-            return self._control_session
-        async with self._control_session_lock:
-            if self._control_session and not self._control_session.closed:
-                return self._control_session
+    async def _ensure_http_session(self) -> aiohttp.ClientSession:
+        if self._http_session and not self._http_session.closed:
+            return self._http_session
+        async with self._http_session_lock:
+            if self._http_session and not self._http_session.closed:
+                return self._http_session
             connector = aiohttp.TCPConnector(
-                limit=self.kv_config.control_max_connections,
-                limit_per_host=self.kv_config.control_max_connections_per_host,
+                limit=max(
+                    1,
+                    self.kv_config.control_max_connections
+                    + self.kv_config.put_max_connections,
+                ),
+                limit_per_host=max(
+                    1,
+                    self.kv_config.control_max_connections_per_host
+                    + self.kv_config.put_max_connections_per_host,
+                ),
                 ttl_dns_cache=self.kv_config.dns_ttl,
                 keepalive_timeout=self.kv_config.connection_keepalive,
                 enable_cleanup_closed=True,
@@ -635,39 +634,14 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 connect=self.kv_config.http_connect_timeout_ms / 1000.0,
                 sock_read=self.kv_config.http_read_timeout_ms / 1000.0,
             )
-            self._control_session = aiohttp.ClientSession(
+            self._http_session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,
-                headers={"User-Agent": "LMCache-KVServiceSM-Control"},
+                headers={"User-Agent": "LMCache-KVServiceSM-Client"},
             )
-            return self._control_session
+            return self._http_session
 
-    async def _ensure_data_session(self) -> aiohttp.ClientSession:
-        if self._data_session and not self._data_session.closed:
-            return self._data_session
-        async with self._data_session_lock:
-            if self._data_session and not self._data_session.closed:
-                return self._data_session
-            connector = aiohttp.TCPConnector(
-                limit=self.kv_config.put_max_connections,
-                limit_per_host=self.kv_config.put_max_connections_per_host,
-                ttl_dns_cache=self.kv_config.dns_ttl,
-                keepalive_timeout=self.kv_config.connection_keepalive,
-                enable_cleanup_closed=True,
-            )
-            timeout = aiohttp.ClientTimeout(
-                total=30,
-                connect=self.kv_config.http_connect_timeout_ms / 1000.0,
-                sock_read=self.kv_config.http_read_timeout_ms / 1000.0,
-            )
-            self._data_session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-                headers={"User-Agent": "LMCache-KVServiceSM-Put"},
-            )
-            return self._data_session
-
-    async def _control_http_request(
+    async def _http_request(
         self,
         method: str,
         url: str,
@@ -675,27 +649,27 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         data: Optional[bytes] = None,
         params: Optional[dict] = None,
         timeout: float = 5.0,
+        gate: Optional[asyncio.Semaphore] = None,
     ) -> Optional[dict]:
-        return await self._http_request_common(
-            self._ensure_control_session, method, url, data=data, params=params, timeout=timeout
-        )
-
-    async def _data_http_request(
-        self,
-        method: str,
-        url: str,
-        *,
-        data: Optional[bytes] = None,
-        params: Optional[dict] = None,
-        timeout: float = 5.0,
-    ) -> Optional[dict]:
-        return await self._http_request_common(
-            self._ensure_data_session, method, url, data=data, params=params, timeout=timeout
-        )
+        if gate is None:
+            return await self._http_request_common(
+                method,
+                url,
+                data=data,
+                params=params,
+                timeout=timeout,
+            )
+        async with gate:
+            return await self._http_request_common(
+                method,
+                url,
+                data=data,
+                params=params,
+                timeout=timeout,
+            )
 
     async def _http_request_common(
         self,
-        session_getter,
         method: str,
         url: str,
         *,
@@ -704,7 +678,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         timeout: float,
     ) -> Optional[dict]:
         try:
-            session = await session_getter()
+            session = await self._ensure_http_session()
             request_timeout = aiohttp.ClientTimeout(total=timeout)
             async with session.request(
                 method,
@@ -731,7 +705,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             logger.error(f"HTTP {method} request failed for {url}: {exc}")
             return None
 
-    async def _ensure_shared_memory(self) -> bool:
+    def _ensure_shared_memory(self) -> bool:
         with self._shared_memory_lock:
             if self._shared_memory_map is not None:
                 return True
@@ -753,12 +727,12 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 logger.error(f"Failed to open shared memory '{name}': {exc}")
                 return False
 
-    async def _read_from_shared_memory(
+    def _read_from_shared_memory(
         self,
         key: CacheEngineKey,
         lease_info: LeaseInfo,
     ) -> Optional[MemoryObj]:
-        if not await self._ensure_shared_memory() or self._shared_memory_map is None:
+        if not self._ensure_shared_memory() or self._shared_memory_map is None:
             return None
 
         # RemoteMetadata header is 7 int32 = 28 bytes
