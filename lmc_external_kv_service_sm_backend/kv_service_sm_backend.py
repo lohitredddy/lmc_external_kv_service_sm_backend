@@ -20,7 +20,7 @@ from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from multiprocessing import shared_memory
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import AsyncIterator, Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
 import time
 import threading
@@ -96,6 +96,18 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             "kv_service_sm_get_timeout_ms",
             max(2000, self.kv_config.http_read_timeout_ms),
         )
+        # Minimal tracing (disabled by default) for low-noise visibility
+        self._trace_enabled: bool = bool(self.kv_config.trace_enabled)
+        # Fixed internal thresholds (ms) to avoid config bloat
+        self._trace_contains_ms_threshold: float = 50.0
+        self._trace_put_queue_ms_threshold: float = 20.0
+        self._trace_put_serialize_ms_threshold: float = 30.0
+        self._trace_put_http_ms_threshold: float = 100.0
+
+        # Limit concurrent PUT preparation/streaming to avoid saturating CPU/memory bandwidth
+        stream_concurrency = max(1, int(self.kv_config.put_stream_concurrency))
+        self._put_serialize_inflight = asyncio.Semaphore(stream_concurrency)
+        self._put_stream_chunk_bytes = max(1, int(self.kv_config.put_stream_chunk_bytes))
 
         # Memory management helpers
         self.memory_allocator = local_cpu_backend.get_memory_allocator()
@@ -156,6 +168,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         """Return True when KVServiceSM reports the key exists."""
         if self._closed:
             return False
+        t0 = time.perf_counter()
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self._contains_async(key), self.loop
@@ -163,16 +176,36 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             # Increase timeout to handle executor queue delays
             # 2x lease timeout + 1s buffer
             timeout_s = (self.kv_config.lease_timeout_ms * 2 + 1000) / 1000.0
-            return future.result(timeout=timeout_s)
+            result = future.result(timeout=timeout_s)
+            if self._trace_enabled:
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                if elapsed_ms >= self._trace_contains_ms_threshold:
+                    logger.info(
+                        f"[KVSM][contains] result={'hit' if result else 'miss'}|total={elapsed_ms:.1f}ms|key={self._key_short(key)}"
+                    )
+            return result
 
         except FuturesTimeoutError:
             # Expected under high load - debug level
-            logger.debug(f"contains() timeout for {key} (executor queue saturated)")
+            if self._trace_enabled:
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                logger.info(
+                    f"[KVSM][contains] miss|timeout|total={elapsed_ms:.1f}ms|key={self._key_short(key)}"
+                )
+            else:
+                logger.debug(
+                    f"contains() timeout for {key} (executor queue saturated)"
+                )
             return False
 
         except Exception as exc:
             # Unexpected errors - warning level
             logger.warning(f"contains() failed for {key}: {exc}")
+            if self._trace_enabled:
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                logger.info(
+                    f"[KVSM][contains] miss|error={type(exc).__name__}|total={elapsed_ms:.1f}ms|key={self._key_short(key)}"
+                )
             return False
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -209,11 +242,13 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 return existing
 
             memory_obj.ref_count_up()
+            queued_at = time.perf_counter()
             future = asyncio.run_coroutine_threadsafe(
                 self._executor.submit_job(
                     self._put_once,
                     key,
                     memory_obj,
+                    queued_at,
                     priority=_KVSMTaskPriority.PUT,
                 ),
                 self.loop,
@@ -370,8 +405,11 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         self._cache_put_lease(key, lease)
         return True
 
-    async def _put_once(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+    async def _put_once(self, key: CacheEngineKey, memory_obj: MemoryObj, queued_at: Optional[float] = None) -> None:
         key_str = key.to_string()
+        q_ms: Optional[float] = None
+        if queued_at is not None:
+            q_ms = (time.perf_counter() - queued_at) * 1000.0
         try:
             # Fast path 1: Check lease cache (key exists on server)
             cached_lease = self._cache_peek_lease(key)
@@ -384,18 +422,24 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 logger.debug(f"Skipping PUT for {key}: recently PUT")
                 return
 
-            # Slow path: Serialize payload (EXPENSIVE for large prompts!)
-            payload = await asyncio.to_thread(self._memory_obj_to_bytes, memory_obj)
+            # Slow path: Prepare streaming payload (header + KV bytes)
+            t_ser = time.perf_counter()
+            async with self._put_serialize_inflight:
+                payload_len, payload_iter = self._build_put_stream(memory_obj)
+            ser_ms = (time.perf_counter() - t_ser) * 1000.0
             url = self._build_kv_url(key)
 
             # Send PUT request (gate on network only)
+            t_http = time.perf_counter()
             response = await self._http_request(
                 "PUT",
                 url,
-                data=payload,
+                data=payload_iter,
                 timeout=self.kv_config.put_timeout_ms / 1000.0,
                 gate=self._put_inflight,
+                headers={"Content-Length": str(payload_len)},
             )
+            http_ms = (time.perf_counter() - t_http) * 1000.0
 
             # Handle response
             if response and response.get("status") == 200:
@@ -414,12 +458,37 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 status = None if response is None else response.get("status")
                 logger.error(f"PUT failed for {key}: HTTP {status}")
 
+            if self._trace_enabled:
+                size_mb = payload_len / (1024.0 * 1024.0)
+                status = None if response is None else response.get("status")
+                threshold_hit = False
+                if q_ms is not None and q_ms >= self._trace_put_queue_ms_threshold:
+                    threshold_hit = True
+                if ser_ms >= self._trace_put_serialize_ms_threshold:
+                    threshold_hit = True
+                if http_ms >= self._trace_put_http_ms_threshold:
+                    threshold_hit = True
+                if status not in (200, 409):
+                    threshold_hit = True
+                if threshold_hit:
+                    q_str = f"{q_ms:.1f}" if q_ms is not None else "n/a"
+                    logger.info(
+                        f"[KVSM][put] q={q_str}ms ser={ser_ms:.1f}ms http={http_ms:.1f}ms size={size_mb:.2f}MB status={status}|key={self._key_short(key)}"
+                    )
+
         except Exception as exc:  # pragma: no cover - log and continue
             logger.error(f"PUT exception for {key}: {exc}")
         finally:
             memory_obj.ref_count_down()
             with self._put_lock:
                 self._put_futures.pop(key_str, None)
+
+    def _key_short(self, key: CacheEngineKey) -> str:
+        try:
+            s = key.to_string()
+            return s if len(s) <= 64 else s[:64]
+        except Exception:
+            return "<key>"
 
     async def _get_memory_obj(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         lease = self._cache_take_lease(key)
@@ -589,6 +658,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             "timeout_ms": self.kv_config.lease_timeout_ms,
             "ttl_s": self.kv_config.lease_ttl_s,
         }
+        t_req = time.perf_counter()
         response = await self._http_request(
             "POST",
             url,
@@ -596,6 +666,13 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             timeout=self.kv_config.lease_timeout_ms / 1000.0,
             gate=self._control_inflight,
         )
+        if self._trace_enabled:
+            http_ms = (time.perf_counter() - t_req) * 1000.0
+            if http_ms >= self._trace_contains_ms_threshold:
+                status = None if not response else response.get("status")
+                logger.info(
+                    f"[KVSM][lease] http={http_ms:.1f}ms|status={status}|key={self._key_short(key)}"
+                )
         if not response or response.get("status") != 200 or not response.get("json"):
             return None
         data = response["json"]
@@ -646,10 +723,11 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         method: str,
         url: str,
         *,
-        data: Optional[bytes] = None,
+        data=None,
         params: Optional[dict] = None,
         timeout: float = 5.0,
         gate: Optional[asyncio.Semaphore] = None,
+        headers: Optional[dict[str, str]] = None,
     ) -> Optional[dict]:
         if gate is None:
             return await self._http_request_common(
@@ -658,6 +736,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 data=data,
                 params=params,
                 timeout=timeout,
+                headers=headers,
             )
         async with gate:
             return await self._http_request_common(
@@ -666,6 +745,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 data=data,
                 params=params,
                 timeout=timeout,
+                headers=headers,
             )
 
     async def _http_request_common(
@@ -673,9 +753,10 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         method: str,
         url: str,
         *,
-        data: Optional[bytes] = None,
+        data=None,
         params: Optional[dict] = None,
         timeout: float,
+        headers: Optional[dict[str, str]] = None,
     ) -> Optional[dict]:
         try:
             session = await self._ensure_http_session()
@@ -686,6 +767,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 data=data,
                 params=params,
                 timeout=request_timeout,
+                headers=headers,
             ) as response:
                 content_type = response.headers.get("Content-Type", "")
                 body_json = None
@@ -802,6 +884,45 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             return None
 
         return memory_obj
+
+    def _build_put_stream(
+        self,
+        memory_obj: MemoryObj,
+    ) -> tuple[int, AsyncIterator[object]]:
+        """Build streaming payload (header + KV bytes) without extra copies."""
+
+        # Prepare metadata header
+        kv_view = memory_obj.byte_array
+        if not isinstance(kv_view, memoryview):
+            kv_view = memoryview(kv_view)
+        if getattr(kv_view, "format", None) == "<B":
+            kv_view = kv_view.cast("B")
+
+        kv_len = len(kv_view)
+        shape = list(memory_obj.get_shape())
+        padded_shape = (shape + [0] * 4)[:4]
+        metadata = RemoteMetadata(
+            kv_len,
+            torch.Size(padded_shape),
+            memory_obj.get_dtype(),
+            memory_obj.get_memory_format(),
+        )
+
+        header = bytearray(4 * 7)
+        metadata.serialize_into(header)
+        header_bytes = bytes(header)
+        total_len = len(header_bytes) + kv_len
+        chunk_size = max(1, self._put_stream_chunk_bytes)
+
+        async def generator() -> AsyncIterator[object]:
+            yield header_bytes
+            offset = 0
+            while offset < kv_len:
+                next_offset = min(kv_len, offset + chunk_size)
+                yield kv_view[offset:next_offset]
+                offset = next_offset
+
+        return total_len, generator()
 
     def _memory_obj_to_bytes(self, memory_obj: MemoryObj) -> bytes:
         kv_bytes = memory_obj.byte_array

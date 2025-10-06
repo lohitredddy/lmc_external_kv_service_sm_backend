@@ -50,12 +50,31 @@ class KVServiceSMConfig:
     put_cache_ttl_s: int = 10              # Recent PUT cache TTL (seconds)
     put_cache_max_size: int = 20000        # Max PUT cache entries
 
+    # Client-side streaming / diagnostics
+    put_stream_concurrency: int = 8
+    put_stream_chunk_bytes: int = 4 * 1024 * 1024
+    trace_enabled: bool = True
+
     @classmethod
     def from_extra_config(cls, extra_config: Optional[dict]) -> "KVServiceSMConfig":
         """Create config from LMCache extra_config dictionary."""
         if extra_config is None:
             return cls()
         
+        # Helper converters with sane defaults
+        def _to_int(value, default):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _to_bool(value, default):
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return default
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
         # Extract values with proper defaults
         return cls(
             base_url=extra_config.get("kv_service_sm_url", cls.base_url),
@@ -80,4 +99,18 @@ class KVServiceSMConfig:
             lease_cache_max_size=extra_config.get("lease_cache_max_size", cls.lease_cache_max_size),
             put_cache_ttl_s=extra_config.get("put_cache_ttl_s", cls.put_cache_ttl_s),
             put_cache_max_size=extra_config.get("put_cache_max_size", cls.put_cache_max_size),
+
+            # Client-side streaming / diagnostics
+            put_stream_concurrency=_to_int(
+                extra_config.get("kv_service_sm_put_stream_concurrency", cls.put_stream_concurrency),
+                cls.put_stream_concurrency,
+            ),
+            put_stream_chunk_bytes=_to_int(
+                extra_config.get("kv_service_sm_put_stream_chunk_bytes", cls.put_stream_chunk_bytes),
+                cls.put_stream_chunk_bytes,
+            ),
+            trace_enabled=_to_bool(
+                extra_config.get("kv_service_sm_trace", cls.trace_enabled),
+                cls.trace_enabled,
+            ),
         )
