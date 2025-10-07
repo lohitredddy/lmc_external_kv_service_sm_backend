@@ -20,7 +20,7 @@ from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from multiprocessing import shared_memory
-from typing import AsyncIterator, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, AsyncIterator, Awaitable, Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
 import time
 import threading
@@ -54,7 +54,52 @@ class LeaseInfo:
 
     lease_id: str
     offsets: List[Tuple[int, int]]
-    total_size: int
+
+
+class _TTLCache:
+    """Simple TTL-bound cache used for leases and recent PUT tracking."""
+
+    def __init__(self, ttl_s: float, max_size: int) -> None:
+        self.ttl_s = float(ttl_s)
+        self.max_size = max_size
+        self._store: Dict[str, tuple[Any, float]] = {}
+
+    def get(self, key: str) -> Optional[Any]:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        value, cached_at = entry
+        if time.monotonic() - cached_at > self.ttl_s:
+            self._store.pop(key, None)
+            return None
+        return value
+
+    def contains(self, key: str) -> bool:
+        return self.get(key) is not None
+
+    def put(self, key: str, value: Any) -> None:
+        self._store[key] = (value, time.monotonic())
+        self._evict_if_needed()
+
+    def take(self, key: str) -> Optional[Any]:
+        value = self.get(key)
+        if value is None:
+            return None
+        self._store.pop(key, None)
+        return value
+
+    def clear(self) -> None:
+        self._store.clear()
+
+    def _evict_if_needed(self) -> None:
+        if self.max_size <= 0 or len(self._store) <= self.max_size:
+            return
+        num_to_evict = self.max_size // 10
+        if num_to_evict <= 0:
+            num_to_evict = len(self._store) - self.max_size
+        oldest = sorted(self._store.items(), key=lambda item: item[1][1])
+        for key, _ in oldest[:num_to_evict]:
+            self._store.pop(key, None)
 
 
 class _KVSMTaskPriority(IntEnum):
@@ -144,39 +189,35 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
         # Short-lived lease cache so contains() can be followed by get() without
         # re-acquiring the lease. TTL tracks the server lease TTL by default.
-        self._lease_cache: Dict[str, tuple[LeaseInfo, float]] = {}
-        self._lease_cache_ttl_s = float(self.kv_config.lease_ttl_s)
-        # Optional override: bridge TTL for contains->get only
+        lease_cache_ttl_s = float(self.kv_config.lease_ttl_s)
         bridge_ms = extra_config.get("kv_service_sm_client_bridge_ttl_ms")
         if bridge_ms is not None:
             try:
-                self._lease_cache_ttl_s = max(0.0, float(bridge_ms) / 1000.0)
+                lease_cache_ttl_s = max(0.0, float(bridge_ms) / 1000.0)
             except Exception:
                 pass
-        self._lease_cache_max_size = self.kv_config.lease_cache_max_size
+        self._lease_cache = _TTLCache(
+            ttl_s=lease_cache_ttl_s,
+            max_size=self.kv_config.lease_cache_max_size,
+        )
 
         # Recent PUT cache (skip redundant serialization + 409s)
-        self._recent_puts: Dict[str, float] = {}
-        self._recent_put_ttl_s = float(self.kv_config.put_cache_ttl_s)
-        self._recent_put_max_size = self.kv_config.put_cache_max_size
+        self._recent_puts = _TTLCache(
+            ttl_s=float(self.kv_config.put_cache_ttl_s),
+            max_size=self.kv_config.put_cache_max_size,
+        )
 
-    # ------------------------------------------------------------------
-    # Public API expected by the base interface
-    # ------------------------------------------------------------------
-
-    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:  # noqa: ARG002
+    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         """Return True when KVServiceSM reports the key exists."""
         if self._closed:
             return False
         t0 = time.perf_counter()
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._contains_async(key), self.loop
+            timeout_s = (self.kv_config.lease_timeout_ms + 1000) / 1000.0
+            result = self._run_sync(
+                self._contains_async(key),
+                timeout=timeout_s,
             )
-            # Increase timeout to handle executor queue delays
-            # 2x lease timeout + 1s buffer
-            timeout_s = (self.kv_config.lease_timeout_ms * 2 + 1000) / 1000.0
-            result = future.result(timeout=timeout_s)
             if self._trace_enabled:
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 if elapsed_ms >= self._trace_contains_ms_threshold:
@@ -213,6 +254,13 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         with self._put_lock:
             return key_str in self._put_futures
 
+    def _submit_async(self, awaitable: Awaitable) -> Future:
+        return asyncio.run_coroutine_threadsafe(awaitable, self.loop)
+
+    def _run_sync(self, awaitable: Awaitable, *, timeout: Optional[float] = None):
+        future = self._submit_async(awaitable)
+        return future.result(timeout=timeout)
+
     @_lmcache_nvtx_annotate
     def batched_submit_put_task(
         self,
@@ -243,15 +291,14 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
             memory_obj.ref_count_up()
             queued_at = time.perf_counter()
-            future = asyncio.run_coroutine_threadsafe(
+            future = self._submit_async(
                 self._executor.submit_job(
                     self._put_once,
                     key,
                     memory_obj,
                     queued_at,
                     priority=_KVSMTaskPriority.PUT,
-                ),
-                self.loop,
+                )
             )
             self._put_futures[key_str] = future
             return future
@@ -259,32 +306,30 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
     def submit_prefetch_task(self, key: CacheEngineKey) -> Optional[Future]:
         if self._closed:
             return None
-        return asyncio.run_coroutine_threadsafe(
-            self._get_memory_obj(key), self.loop
-        )
+        return self._submit_async(self._get_memory_obj(key))
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         if self._closed:
             return None
-        future = asyncio.run_coroutine_threadsafe(
-            self._get_memory_obj(key), self.loop
-        )
         try:
-            return future.result(timeout=self._get_timeout_ms / 1000.0)
-        except Exception as exc:  # pragma: no cover - defensive logging
+            return self._run_sync(
+                self._get_memory_obj(key),
+                timeout=self._get_timeout_ms / 1000.0,
+            )
+        except Exception as exc:
             logger.error(f"get_blocking() failed for key {key}: {exc}")
             return None
 
     def get_non_blocking(self, key: CacheEngineKey) -> Optional[Future]:
         return self.submit_prefetch_task(key)
 
-    def pin(self, key: CacheEngineKey) -> bool:  # noqa: ARG002 - no-op
+    def pin(self, key: CacheEngineKey) -> bool:
         return True
 
-    def unpin(self, key: CacheEngineKey) -> bool:  # noqa: ARG002 - no-op
+    def unpin(self, key: CacheEngineKey) -> bool:
         return True
 
-    def remove(self, key: CacheEngineKey, force: bool = True) -> bool:  # noqa: ARG002
+    def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
         # Backend does not currently expose delete; treat as best-effort success.
         return True
 
@@ -298,17 +343,15 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 self._put_futures.clear()
 
             # Clear caches (no locks needed)
-            self._lease_cache = {}
-            self._recent_puts = {}
+            self._lease_cache.clear()
+            self._recent_puts.clear()
 
             self._executor.shutdown(wait=True)
 
             # Close HTTP session
             if self._http_session is not None:
                 try:
-                    asyncio.run_coroutine_threadsafe(
-                        self._http_session.close(), self.loop
-                    ).result(timeout=5)
+                    self._run_sync(self._http_session.close(), timeout=5)
                 except Exception:
                     pass
                 self._http_session = None
@@ -327,7 +370,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                     except Exception:
                         pass
                     self._shared_memory_obj = None
-        except Exception as exc:  # pragma: no cover - shutdown should not raise
+        except Exception as exc:
             logger.error(f"Error while closing KVServiceSMBackend: {exc}")
 
     def get_allocator_backend(self):
@@ -345,9 +388,9 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
     async def batched_async_contains(
         self,
-        lookup_id: str,  # noqa: ARG002 - reserved for compatibility
+        lookup_id: str,
         keys: List[CacheEngineKey],
-        pin: bool = False,  # noqa: ARG002
+        pin: bool = False,
     ) -> int:
         if not keys:
             return 0
@@ -373,7 +416,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
     async def batched_get_non_blocking(
         self,
-        lookup_id: str,  # noqa: ARG002 - reserved for compatibility
+        lookup_id: str,
         keys: List[CacheEngineKey],
         transfer_spec=None,
     ) -> List[MemoryObj]:
@@ -383,10 +426,6 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             if memory_obj is not None:
                 results.append(memory_obj)
         return results
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     async def _contains_async(self, key: CacheEngineKey) -> bool:
         # Fast path: if a valid cached lease exists, treat as contained.
@@ -458,25 +497,17 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
                 status = None if response is None else response.get("status")
                 logger.error(f"PUT failed for {key}: HTTP {status}")
 
-            if self._trace_enabled:
-                size_mb = payload_len / (1024.0 * 1024.0)
-                status = None if response is None else response.get("status")
-                threshold_hit = False
-                if q_ms is not None and q_ms >= self._trace_put_queue_ms_threshold:
-                    threshold_hit = True
-                if ser_ms >= self._trace_put_serialize_ms_threshold:
-                    threshold_hit = True
-                if http_ms >= self._trace_put_http_ms_threshold:
-                    threshold_hit = True
-                if status not in (200, 409):
-                    threshold_hit = True
-                if threshold_hit:
-                    q_str = f"{q_ms:.1f}" if q_ms is not None else "n/a"
-                    logger.info(
-                        f"[KVSM][put] q={q_str}ms ser={ser_ms:.1f}ms http={http_ms:.1f}ms size={size_mb:.2f}MB status={status}|key={self._key_short(key)}"
-                    )
+            status = None if response is None else response.get("status")
+            self._trace_put_event(
+                queue_ms=q_ms,
+                serialize_ms=ser_ms,
+                http_ms=http_ms,
+                status=status,
+                payload_len=payload_len,
+                key=key,
+            )
 
-        except Exception as exc:  # pragma: no cover - log and continue
+        except Exception as exc:
             logger.error(f"PUT exception for {key}: {exc}")
         finally:
             memory_obj.ref_count_down()
@@ -502,158 +533,59 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             return None
         return self._read_from_shared_memory(key, lease)
 
-    # ------------------------------------------------------------------
-    # Common cache helper functions
-    # ------------------------------------------------------------------
-
-    def _cache_get_with_ttl(
-        self,
-        cache: Dict[str, tuple],
-        key_str: str,
-        ttl_s: float,
-    ) -> Optional[tuple]:
-        """Generic cache getter with strict TTL check and lazy cleanup.
-
-        Returns value if exists and not expired, None otherwise.
-        Atomically deletes expired entries.
-        """
-        entry = cache.get(key_str)
-        if entry is None:
-            return None
-
-        # For lease cache: entry is (lease, timestamp)
-        # For PUT cache: entry is timestamp
-        if isinstance(entry, tuple) and len(entry) == 2:
-            data, cached_at = entry
-            if time.monotonic() - cached_at > ttl_s:
-                cache.pop(key_str, None)
-                return None
-            return entry
-        else:
-            # Simple timestamp value (PUT cache)
-            if time.monotonic() - entry > ttl_s:
-                cache.pop(key_str, None)
-                return None
-            return entry
-
-    def _cache_put_with_eviction(
-        self,
-        cache: Dict[str, tuple],
-        key_str: str,
-        value: tuple,
-        max_size: int,
-    ) -> None:
-        """Generic cache setter with size-bounded eviction.
-
-        Inserts value and evicts oldest 10% if size exceeded.
-        """
-        cache[key_str] = value
-
-        # Size-bounded eviction
-        if len(cache) > max_size:
-            num_to_evict = max_size // 10  # Evict 10%
-
-            # Sort by timestamp
-            # For lease cache: value is (data, timestamp) - use x[1][1]
-            # For PUT cache: value is timestamp - use x[1]
-            if isinstance(value, tuple) and len(value) == 2:
-                # Lease cache
-                sorted_items = sorted(
-                    cache.items(),
-                    key=lambda x: x[1][1]  # x[1][1] is timestamp
-                )
-            else:
-                # PUT cache
-                sorted_items = sorted(
-                    cache.items(),
-                    key=lambda x: x[1]  # x[1] is timestamp
-                )
-
-            # Evict oldest
-            for old_key, _ in sorted_items[:num_to_evict]:
-                cache.pop(old_key, None)
-
-    # ------------------------------------------------------------------
-    # Lease cache methods
-    # ------------------------------------------------------------------
-
     def _cache_put_lease(self, key: CacheEngineKey, lease: LeaseInfo) -> None:
         """Cache lease with size-bounded eviction. Atomic, no lock."""
-        key_str = key.to_string()
-        cached_at = time.monotonic()
-
-        self._cache_put_with_eviction(
-            self._lease_cache,
-            key_str,
-            (lease, cached_at),
-            self._lease_cache_max_size,
-        )
+        self._lease_cache.put(key.to_string(), lease)
 
     def _cache_take_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
         """Consume a cached lease if within TTL. Atomic, no lock."""
-        key_str = key.to_string()
-        entry = self._cache_get_with_ttl(
-            self._lease_cache,
-            key_str,
-            self._lease_cache_ttl_s,
-        )
-        if entry is None:
-            return None
-        lease, _ = entry
-        # consume
-        self._lease_cache.pop(key_str, None)
-        return lease
+        return self._lease_cache.take(key.to_string())
 
     def _cache_peek_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
         """Return cached lease ONLY if within TTL. Atomic, no lock."""
-        key_str = key.to_string()
-
-        entry = self._cache_get_with_ttl(
-            self._lease_cache,
-            key_str,
-            self._lease_cache_ttl_s,
-        )
-
-        if entry is None:
-            return None
-
-        # Entry is (lease, timestamp)
-        lease, _ = entry
-        return lease
-
-    # ------------------------------------------------------------------
-    # Recent PUT cache methods
-    # ------------------------------------------------------------------
+        return self._lease_cache.get(key.to_string())
 
     def _check_recent_put(self, key: CacheEngineKey) -> bool:
         """Check if key was recently PUT. STRICT TTL enforcement. Atomic, no lock."""
-        key_str = key.to_string()
-
-        result = self._cache_get_with_ttl(
-            self._recent_puts,
-            key_str,
-            self._recent_put_ttl_s,
-        )
-
-        return result is not None
+        return self._recent_puts.contains(key.to_string())
 
     def _mark_recent_put(self, key: CacheEngineKey) -> None:
         """Mark key as recently PUT with size-bounded eviction. Atomic, no lock."""
-        key_str = key.to_string()
+        self._recent_puts.put(key.to_string(), None)
 
-        self._cache_put_with_eviction(
-            self._recent_puts,
-            key_str,
-            time.monotonic(),
-            self._recent_put_max_size,
+    def _trace_put_event(
+        self,
+        *,
+        queue_ms: Optional[float],
+        serialize_ms: float,
+        http_ms: float,
+        status: Optional[int],
+        payload_len: int,
+        key: CacheEngineKey,
+    ) -> None:
+        if not self._trace_enabled:
+            return
+
+        threshold_hit = False
+        if queue_ms is not None and queue_ms >= self._trace_put_queue_ms_threshold:
+            threshold_hit = True
+        if serialize_ms >= self._trace_put_serialize_ms_threshold:
+            threshold_hit = True
+        if http_ms >= self._trace_put_http_ms_threshold:
+            threshold_hit = True
+        if status not in (200, 409):
+            threshold_hit = True
+        if not threshold_hit:
+            return
+
+        size_mb = payload_len / (1024.0 * 1024.0)
+        q_str = f"{queue_ms:.1f}" if queue_ms is not None else "n/a"
+        logger.info(
+            f"[KVSM][put] q={q_str}ms ser={serialize_ms:.1f}ms http={http_ms:.1f}ms size={size_mb:.2f}MB status={status}|key={self._key_short(key)}"
         )
 
-    # ------------------------------------------------------------------
-    # Lease acquisition
-    # ------------------------------------------------------------------
-
     async def _acquire_lease(self, key: CacheEngineKey) -> Optional[LeaseInfo]:
-        url = f"{self.kv_config.base_url}/v1/kv/{self.kv_config.bucket_name}/{self._key_to_string(key)}/leases"
+        url = self._build_lease_url(key)
         params = {
             "timeout_ms": self.kv_config.lease_timeout_ms,
             "ttl_s": self.kv_config.lease_ttl_s,
@@ -682,7 +614,6 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         return LeaseInfo(
             lease_id=data["id"],
             offsets=offsets,
-            total_size=sum(length for _, length in offsets),
         )
 
     async def _ensure_http_session(self) -> aiohttp.ClientSession:
@@ -783,7 +714,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         except aiohttp.ClientError as exc:
             logger.error(f"HTTP {method} client error for {url}: {exc}")
             return None
-        except Exception as exc:  # pragma: no cover - unexpected failures
+        except Exception as exc:
             logger.error(f"HTTP {method} request failed for {url}: {exc}")
             return None
 
@@ -924,20 +855,11 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
         return total_len, generator()
 
-    def _memory_obj_to_bytes(self, memory_obj: MemoryObj) -> bytes:
-        kv_bytes = memory_obj.byte_array
-        shape = list(memory_obj.get_shape())
-        padded_shape = (shape + [0] * 4)[:4]
-        metadata = RemoteMetadata(
-            len(kv_bytes),
-            torch.Size(padded_shape),
-            memory_obj.get_dtype(),
-            memory_obj.get_memory_format(),
-        )
-        return metadata.serialize() + kv_bytes
-
     def _key_to_string(self, key: CacheEngineKey) -> str:
         return urllib.parse.quote(key.to_string(), safe="")
 
     def _build_kv_url(self, key: CacheEngineKey) -> str:
         return f"{self.kv_config.base_url}/v1/kv/{self.kv_config.bucket_name}/{self._key_to_string(key)}"
+
+    def _build_lease_url(self, key: CacheEngineKey) -> str:
+        return f"{self._build_kv_url(key)}/leases"
