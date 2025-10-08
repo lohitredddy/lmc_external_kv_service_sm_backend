@@ -449,6 +449,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         q_ms: Optional[float] = None
         if queued_at is not None:
             q_ms = (time.perf_counter() - queued_at) * 1000.0
+        release_needed = True
         try:
             # Fast path 1: Check lease cache (key exists on server)
             cached_lease = self._cache_peek_lease(key)
@@ -465,6 +466,8 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             t_ser = time.perf_counter()
             async with self._put_serialize_inflight:
                 payload_len, payload_iter = self._build_put_stream(memory_obj)
+            memory_obj.ref_count_down()
+            release_needed = False
             ser_ms = (time.perf_counter() - t_ser) * 1000.0
             url = self._build_kv_url(key)
 
@@ -510,7 +513,8 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         except Exception as exc:
             logger.error(f"PUT exception for {key}: {exc}")
         finally:
-            memory_obj.ref_count_down()
+            if release_needed:
+                memory_obj.ref_count_down()
             with self._put_lock:
                 self._put_futures.pop(key_str, None)
 
@@ -820,12 +824,12 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         self,
         memory_obj: MemoryObj,
     ) -> tuple[int, AsyncIterator[object]]:
-        """Build streaming payload (header + KV bytes) without extra copies."""
+        """Build streaming payload (header + KV bytes) using a detached buffer."""
 
         # Prepare metadata header
-        kv_view = memory_obj.byte_array
-        if not isinstance(kv_view, memoryview):
-            kv_view = memoryview(kv_view)
+        # Copy into an immutable buffer so the source tensor can be released early
+        kv_bytes = bytes(memory_obj.byte_array)
+        kv_view = memoryview(kv_bytes)
         if getattr(kv_view, "format", None) == "<B":
             kv_view = kv_view.cast("B")
 
