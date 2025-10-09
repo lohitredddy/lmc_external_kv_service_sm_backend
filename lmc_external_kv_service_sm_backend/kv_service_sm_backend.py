@@ -35,7 +35,7 @@ from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryObj, MixedMemoryAllocator
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.abstract_backend import ConfigurableStorageBackendInterface
 from lmcache.v1.storage_backend.job_executor.pq_executor import AsyncPQExecutor
@@ -155,7 +155,30 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         self._put_stream_chunk_bytes = max(1, int(self.kv_config.put_stream_chunk_bytes))
 
         # Memory management helpers
-        self.memory_allocator = local_cpu_backend.get_memory_allocator()
+        allocator_gb = extra_config.get("kv_service_sm_allocator_size_gb")
+        if allocator_gb is None:
+            allocator_gb = config.max_local_cpu_size
+        try:
+            allocator_bytes = int(float(allocator_gb) * 1024**3)
+        except Exception:
+            allocator_bytes = int(config.max_local_cpu_size * 1024**3)
+        if allocator_bytes <= 0:
+            allocator_bytes = 1
+        self.memory_allocator = MixedMemoryAllocator(
+            allocator_bytes,
+            numa_mapping=None,
+        )
+        prefetch_limit_cfg = extra_config.get("kv_service_sm_prefetch_concurrency")
+        default_prefetch_limit = max(1, int(self.kv_config.control_max_connections_per_host))
+        try:
+            prefetch_limit = (
+                int(prefetch_limit_cfg)
+                if prefetch_limit_cfg is not None
+                else default_prefetch_limit
+            )
+        except Exception:
+            prefetch_limit = default_prefetch_limit
+        self._prefetch_gate = asyncio.Semaphore(max(1, prefetch_limit))
 
         # Shared resources
         self._http_session: Optional[aiohttp.ClientSession] = None
@@ -348,6 +371,11 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
             self._executor.shutdown(wait=True)
 
+            try:
+                self.memory_allocator.close()
+            except Exception:
+                pass
+
             # Close HTTP session
             if self._http_session is not None:
                 try:
@@ -420,12 +448,13 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         keys: List[CacheEngineKey],
         transfer_spec=None,
     ) -> List[MemoryObj]:
-        results: List[MemoryObj] = []
-        for key in keys:
-            memory_obj = await self._get_memory_obj(key)
-            if memory_obj is not None:
-                results.append(memory_obj)
-        return results
+        async with self._prefetch_gate:
+            results: List[MemoryObj] = []
+            for key in keys:
+                memory_obj = await self._get_memory_obj(key)
+                if memory_obj is not None:
+                    results.append(memory_obj)
+            return results
 
     async def _contains_async(self, key: CacheEngineKey) -> bool:
         # Fast path: if a valid cached lease exists, treat as contained.
