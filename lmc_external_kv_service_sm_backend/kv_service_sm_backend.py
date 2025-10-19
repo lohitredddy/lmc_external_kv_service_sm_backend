@@ -35,7 +35,7 @@ from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryObj, MixedMemoryAllocator
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.abstract_backend import ConfigurableStorageBackendInterface
 from lmcache.v1.storage_backend.job_executor.pq_executor import AsyncPQExecutor
@@ -154,20 +154,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
         self._put_serialize_inflight = asyncio.Semaphore(stream_concurrency)
         self._put_stream_chunk_bytes = max(1, int(self.kv_config.put_stream_chunk_bytes))
 
-        # Memory management helpers
-        allocator_gb = extra_config.get("kv_service_sm_allocator_size_gb")
-        if allocator_gb is None:
-            allocator_gb = config.max_local_cpu_size
-        try:
-            allocator_bytes = int(float(allocator_gb) * 1024**3)
-        except Exception:
-            allocator_bytes = int(config.max_local_cpu_size * 1024**3)
-        if allocator_bytes <= 0:
-            allocator_bytes = 1
-        self.memory_allocator = MixedMemoryAllocator(
-            allocator_bytes,
-            numa_mapping=None,
-        )
+        # Prefetch concurrency gate
         prefetch_limit_cfg = extra_config.get("kv_service_sm_prefetch_concurrency")
         default_prefetch_limit = max(1, int(self.kv_config.control_max_connections_per_host))
         try:
@@ -371,10 +358,7 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
 
             self._executor.shutdown(wait=True)
 
-            try:
-                self.memory_allocator.close()
-            except Exception:
-                pass
+            # No dedicated allocator to close; LocalCPUBackend is managed by LMCache
 
             # Close HTTP session
             if self._http_session is not None:
@@ -805,8 +789,8 @@ class KVServiceSMBackend(ConfigurableStorageBackendInterface):
             logger.error("Invalid payload length %d for key %s", payload_len, key)
             return None
 
-        # 3) Allocate destination
-        memory_obj = self.memory_allocator.allocate(
+        # 3) Allocate destination using LocalCPUBackend
+        memory_obj = self.local_cpu_backend.allocate(
             metadata.shape,
             metadata.dtype,
             metadata.fmt,
